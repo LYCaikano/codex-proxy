@@ -1,0 +1,638 @@
+/**
+ * 账号管理器模块
+ * 负责从磁盘加载账号文件、定时刷新 Token、保存更新后的 Token
+ * 支持热加载新增账号文件、并发刷新（支持 2w+ 账号）、线程安全的账号访问和轮询选择
+ */
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
+
+/* 并发刷新默认配置 */
+const (
+	defaultRefreshConcurrency = 50
+	defaultScanInterval       = 30
+)
+
+/**
+ * Manager 账号管理器
+ * @field mu - 并发保护锁
+ * @field accounts - 已加载的账号列表
+ * @field accountIndex - 文件路径 → 账号索引（O(1) 查找）
+ * @field refresher - Token 刷新器
+ * @field selector - 账号选择器
+ * @field authDir - 账号文件目录
+ * @field refreshInterval - 刷新间隔（秒）
+ * @field refreshConcurrency - 并发刷新数
+ * @field stopCh - 停止信号通道
+ */
+type Manager struct {
+	mu                 sync.RWMutex
+	accounts           []*Account
+	accountIndex       map[string]*Account
+	refresher          *Refresher
+	selector           Selector
+	authDir            string
+	refreshInterval    int
+	refreshConcurrency int
+	stopCh             chan struct{}
+}
+
+/**
+ * NewManager 创建新的账号管理器
+ * @param authDir - 账号文件目录
+ * @param proxyURL - 代理地址
+ * @param refreshInterval - 刷新间隔（秒）
+ * @param selector - 账号选择器
+ * @returns *Manager - 账号管理器实例
+ */
+func NewManager(authDir, proxyURL string, refreshInterval int, selector Selector) *Manager {
+	if selector == nil {
+		selector = NewRoundRobinSelector()
+	}
+	return &Manager{
+		accounts:           make([]*Account, 0, 1024),
+		accountIndex:       make(map[string]*Account, 1024),
+		refresher:          NewRefresher(proxyURL),
+		selector:           selector,
+		authDir:            authDir,
+		refreshInterval:    refreshInterval,
+		refreshConcurrency: defaultRefreshConcurrency,
+		stopCh:             make(chan struct{}),
+	}
+}
+
+/**
+ * SetRefreshConcurrency 设置并发刷新数
+ * @param n - 并发数，默认 50
+ */
+func (m *Manager) SetRefreshConcurrency(n int) {
+	if n > 0 {
+		m.refreshConcurrency = n
+	}
+}
+
+/**
+ * LoadAccounts 从账号目录加载所有 JSON 账号文件
+ * @returns error - 加载失败时返回错误
+ */
+func (m *Manager) LoadAccounts() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entries, err := os.ReadDir(m.authDir)
+	if err != nil {
+		return fmt.Errorf("读取账号目录失败: %w", err)
+	}
+
+	accounts := make([]*Account, 0, len(entries))
+	index := make(map[string]*Account, len(entries))
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+
+		filePath := filepath.Join(m.authDir, entry.Name())
+		acc, loadErr := loadAccountFromFile(filePath)
+		if loadErr != nil {
+			log.Warnf("加载账号文件失败 [%s]: %v", entry.Name(), loadErr)
+			continue
+		}
+
+		accounts = append(accounts, acc)
+		index[filePath] = acc
+	}
+
+	if len(accounts) == 0 {
+		return fmt.Errorf("在目录 %s 中未找到有效的账号文件", m.authDir)
+	}
+
+	m.accounts = accounts
+	m.accountIndex = index
+	log.Infof("共加载 %d 个 Codex 账号", len(accounts))
+	return nil
+}
+
+/**
+ * loadAccountFromFile 从单个 JSON 文件加载账号
+ * @param filePath - 文件路径
+ * @returns *Account - 账号对象
+ * @returns error - 加载失败时返回错误
+ */
+func loadAccountFromFile(filePath string) (*Account, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件失败: %w", err)
+	}
+
+	var tf TokenFile
+	if err = json.Unmarshal(data, &tf); err != nil {
+		return nil, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+
+	if tf.RefreshToken == "" {
+		return nil, fmt.Errorf("文件中缺少 refresh_token")
+	}
+
+	/* 从 ID Token 中补充解析 AccountID、Email、PlanType */
+	accountID := tf.AccountID
+	email := tf.Email
+	var planType string
+	if tf.IDToken != "" {
+		jwtAccountID, jwtEmail, jwtPlan := parseIDTokenClaims(tf.IDToken)
+		if accountID == "" {
+			accountID = jwtAccountID
+		}
+		if email == "" {
+			email = jwtEmail
+		}
+		planType = jwtPlan
+	}
+
+	return &Account{
+		FilePath: filePath,
+		Token: TokenData{
+			IDToken:      tf.IDToken,
+			AccessToken:  tf.AccessToken,
+			RefreshToken: tf.RefreshToken,
+			AccountID:    accountID,
+			Email:        email,
+			Expire:       tf.Expire,
+			PlanType:     planType,
+		},
+		Status: StatusActive,
+	}, nil
+}
+
+/**
+ * Pick 选择下一个可用账号（委托给选择器）
+ * @param model - 请求的模型名称
+ * @returns *Account - 选中的账号
+ * @returns error - 没有可用账号时返回错误
+ */
+func (m *Manager) Pick(model string) (*Account, error) {
+	m.mu.RLock()
+	accounts := m.accounts
+	m.mu.RUnlock()
+
+	return m.selector.Pick(model, accounts)
+}
+
+/**
+ * PickExcluding 选择下一个可用账号，排除已用过的账号
+ * 用于错误重试时切换到不同的账号
+ * @param model - 请求的模型名称
+ * @param excluded - 已排除的账号文件路径集合
+ * @returns *Account - 选中的账号
+ * @returns error - 没有可用账号时返回错误
+ */
+func (m *Manager) PickExcluding(model string, excluded map[string]bool) (*Account, error) {
+	m.mu.RLock()
+	allAccounts := m.accounts
+	m.mu.RUnlock()
+	if len(excluded) == 0 {
+		return m.selector.Pick(model, allAccounts)
+	}
+
+	filtered := make([]*Account, 0, len(allAccounts))
+	for _, acc := range allAccounts {
+		if !excluded[acc.FilePath] {
+			filtered = append(filtered, acc)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("没有更多可用账号（已排除 %d 个）", len(excluded))
+	}
+
+	return m.selector.Pick(model, filtered)
+}
+
+/**
+ * GetAccounts 获取所有账号的只读快照
+ * @returns []*Account - 账号列表
+ */
+func (m *Manager) GetAccounts() []*Account {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]*Account, len(m.accounts))
+	copy(result, m.accounts)
+	return result
+}
+
+/**
+ * AccountCount 返回已加载的账号数量
+ * @returns int - 账号数量
+ */
+func (m *Manager) AccountCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.accounts)
+}
+
+/**
+ * RemoveAccount 从号池和磁盘同时删除异常账号
+ * 内存中移除 + 删除磁盘上的 JSON 文件，彻底清理
+ * @param acc - 要移除的账号
+ * @param reason - 移除原因
+ */
+func (m *Manager) RemoveAccount(acc *Account, reason string) {
+	m.mu.Lock()
+
+	filePath := acc.FilePath
+	email := acc.GetEmail()
+
+	if _, exists := m.accountIndex[filePath]; !exists {
+		m.mu.Unlock()
+		return
+	}
+
+	delete(m.accountIndex, filePath)
+
+	/* 从切片中删除，用末尾覆盖法避免移动大量元素 */
+	for i, a := range m.accounts {
+		if a.FilePath == filePath {
+			last := len(m.accounts) - 1
+			m.accounts[i] = m.accounts[last]
+			m.accounts = m.accounts[:last]
+			break
+		}
+	}
+
+	remaining := len(m.accounts)
+	m.mu.Unlock()
+
+	/* 删除磁盘文件 */
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		log.Errorf("账号 [%s] 磁盘文件删除失败: %v", email, err)
+	} else {
+		log.Warnf("账号 [%s] 已删除（内存+磁盘），原因: %s，剩余 %d 个", email, reason, remaining)
+	}
+}
+
+/**
+ * StartRefreshLoop 启动后台 Token 刷新循环
+ * 每个周期：先扫描新增文件 → 再并发刷新所有账号
+ * @param ctx - 上下文，用于控制生命周期
+ */
+func (m *Manager) StartRefreshLoop(ctx context.Context) {
+	refreshInterval := time.Duration(m.refreshInterval) * time.Second
+	refreshTicker := time.NewTicker(refreshInterval)
+	defer refreshTicker.Stop()
+
+	/* 热加载扫描间隔（比刷新更频繁） */
+	scanInterval := time.Duration(defaultScanInterval) * time.Second
+	if scanInterval > refreshInterval {
+		scanInterval = refreshInterval
+	}
+	scanTicker := time.NewTicker(scanInterval)
+	defer scanTicker.Stop()
+
+	/* 启动时立即执行一次刷新 */
+	m.refreshAllAccountsConcurrent(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("账号刷新循环已停止")
+			return
+		case <-m.stopCh:
+			log.Info("账号刷新循环已停止")
+			return
+		case <-scanTicker.C:
+			/* 定时扫描 auth 目录，热加载新增文件 */
+			m.scanNewFiles()
+		case <-refreshTicker.C:
+			m.scanNewFiles()
+			m.refreshAllAccountsConcurrent(ctx)
+		}
+	}
+}
+
+/**
+ * Stop 停止刷新循环
+ */
+func (m *Manager) Stop() {
+	close(m.stopCh)
+}
+
+/**
+ * scanNewFiles 扫描 auth 目录，加载新增的账号文件到号池
+ * 已存在的文件不会重复加载，已被移除的也不会重新加入（直到文件变更）
+ */
+func (m *Manager) scanNewFiles() {
+	entries, err := os.ReadDir(m.authDir)
+	if err != nil {
+		log.Warnf("扫描账号目录失败: %v", err)
+		return
+	}
+
+	newCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+
+		filePath := filepath.Join(m.authDir, entry.Name())
+
+		/* 检查是否已在号池中 */
+		m.mu.RLock()
+		_, exists := m.accountIndex[filePath]
+		m.mu.RUnlock()
+
+		if exists {
+			continue
+		}
+
+		acc, loadErr := loadAccountFromFile(filePath)
+		if loadErr != nil {
+			continue
+		}
+
+		m.mu.Lock()
+		/* 双检查防止并发 */
+		if _, exists2 := m.accountIndex[filePath]; !exists2 {
+			m.accounts = append(m.accounts, acc)
+			m.accountIndex[filePath] = acc
+			newCount++
+		}
+		m.mu.Unlock()
+	}
+
+	if newCount > 0 {
+		log.Infof("热加载: 新增 %d 个账号，当前总计 %d 个", newCount, m.AccountCount())
+	}
+}
+
+/**
+ * refreshAllAccountsConcurrent 并发刷新所有账号的 Token
+ * 使用 goroutine pool 控制并发数，支持 2w+ 账号高效刷新
+ * @param ctx - 上下文
+ */
+func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
+	m.mu.RLock()
+	accounts := make([]*Account, len(m.accounts))
+	copy(accounts, m.accounts)
+	m.mu.RUnlock()
+
+	if len(accounts) == 0 {
+		return
+	}
+
+	start := time.Now()
+	log.Infof("开始并发刷新 %d 个账号（并发 %d）", len(accounts), m.refreshConcurrency)
+
+	sem := make(chan struct{}, m.refreshConcurrency)
+	var wg sync.WaitGroup
+
+	for _, acc := range accounts {
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(a *Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			m.refreshAccount(ctx, a)
+		}(acc)
+	}
+
+	wg.Wait()
+	log.Infof("刷新完成: %d 个账号，耗时 %v，剩余 %d 个", len(accounts), time.Since(start).Round(time.Millisecond), m.AccountCount())
+}
+
+/**
+ * RefreshResult 手动刷新操作的统计结果
+ * @field Total - 总账号数
+ * @field Success - 刷新成功数
+ * @field Failed - 刷新失败数（已从号池移除）
+ * @field Remaining - 刷新后剩余可用账号数
+ * @field Duration - 操作耗时
+ */
+type RefreshResult struct {
+	Total     int    `json:"total"`
+	Success   int    `json:"success"`
+	Failed    int    `json:"failed"`
+	Remaining int    `json:"remaining"`
+	Duration  string `json:"duration"`
+}
+
+/**
+ * ForceRefreshAll 强制刷新所有账号的 Token（跳过过期时间检查）
+ * 用于管理接口手动触发刷新，同时重置所有冷却状态
+ * @param ctx - 上下文
+ * @returns *RefreshResult - 刷新统计结果
+ */
+func (m *Manager) ForceRefreshAll(ctx context.Context) *RefreshResult {
+	m.mu.RLock()
+	accounts := make([]*Account, len(m.accounts))
+	copy(accounts, m.accounts)
+	m.mu.RUnlock()
+
+	total := len(accounts)
+	if total == 0 {
+		return &RefreshResult{Duration: "0s"}
+	}
+
+	start := time.Now()
+	log.Infof("开始手动强制刷新 %d 个账号（并发 %d）", total, m.refreshConcurrency)
+
+	/* 先重置所有冷却/禁用状态 */
+	for _, acc := range accounts {
+		acc.SetActive()
+	}
+
+	sem := make(chan struct{}, m.refreshConcurrency)
+	var wg sync.WaitGroup
+	var successCount, failCount int64
+	var mu sync.Mutex
+
+	for _, acc := range accounts {
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(a *Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if m.forceRefreshAccount(ctx, a) {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				failCount++
+				mu.Unlock()
+			}
+		}(acc)
+	}
+
+	wg.Wait()
+
+	remaining := m.AccountCount()
+	elapsed := time.Since(start).Round(time.Millisecond)
+	log.Infof("手动刷新完成: 成功 %d, 失败 %d, 耗时 %v, 剩余 %d 个",
+		successCount, failCount, elapsed, remaining)
+
+	return &RefreshResult{
+		Total:     total,
+		Success:   int(successCount),
+		Failed:    int(failCount),
+		Remaining: remaining,
+		Duration:  elapsed.String(),
+	}
+}
+
+/**
+ * forceRefreshAccount 强制刷新单个账号的 Token（跳过过期检查）
+ * @param ctx - 上下文
+ * @param acc - 要刷新的账号
+ * @returns bool - 刷新是否成功
+ */
+func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
+	acc.mu.RLock()
+	refreshToken := acc.Token.RefreshToken
+	email := acc.Token.Email
+	acc.mu.RUnlock()
+
+	if refreshToken == "" {
+		log.Warnf("账号 [%s] 缺少 refresh_token，移除", email)
+		m.RemoveAccount(acc, "missing_refresh_token")
+		return false
+	}
+
+	td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 3)
+	if err != nil {
+		log.Errorf("账号 [%s] Token 刷新失败，从号池移除: %v", email, err)
+		m.RemoveAccount(acc, ReasonRefreshFailed)
+		return false
+	}
+
+	acc.UpdateToken(*td)
+
+	if saveErr := m.saveTokenToFile(acc); saveErr != nil {
+		log.Errorf("账号 [%s] Token 保存失败: %v", email, saveErr)
+	} else {
+		log.Infof("账号 [%s] Token 刷新成功", td.Email)
+	}
+	return true
+}
+
+/**
+ * refreshAccount 刷新单个账号的 Token
+ * 刷新失败时直接从号池移除该账号
+ * 保存时使用原子写入，防止写入失败损坏原文件
+ * @param ctx - 上下文
+ * @param acc - 要刷新的账号
+ */
+func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
+	acc.mu.RLock()
+	refreshToken := acc.Token.RefreshToken
+	email := acc.Token.Email
+	expire := acc.Token.Expire
+	acc.mu.RUnlock()
+
+	if refreshToken == "" {
+		log.Warnf("账号 [%s] 缺少 refresh_token，移除", email)
+		m.RemoveAccount(acc, "missing_refresh_token")
+		return
+	}
+
+	/* 检查 Token 是否即将过期，提前刷新 */
+	needRefresh := true
+	if expire != "" {
+		expireTime, parseErr := time.Parse(time.RFC3339, expire)
+		if parseErr == nil {
+			if time.Until(expireTime) > 5*time.Minute {
+				needRefresh = false
+			}
+		}
+	}
+
+	if !needRefresh {
+		log.Debugf("账号 [%s] Token 仍有效，跳过刷新", email)
+		return
+	}
+
+	log.Debugf("正在刷新账号 [%s]", email)
+
+	td, err := m.refresher.RefreshTokenWithRetry(ctx, refreshToken, 3)
+	if err != nil {
+		log.Errorf("账号 [%s] Token 刷新失败，从号池移除: %v", email, err)
+		m.RemoveAccount(acc, ReasonRefreshFailed)
+		return
+	}
+
+	/* 更新内存中的 Token */
+	acc.UpdateToken(*td)
+
+	/* 原子写入磁盘 */
+	if saveErr := m.saveTokenToFile(acc); saveErr != nil {
+		log.Errorf("账号 [%s] Token 保存失败: %v", email, saveErr)
+	} else {
+		log.Infof("账号 [%s] Token 刷新成功", td.Email)
+	}
+}
+
+/**
+ * saveTokenToFile 将更新后的 Token 原子写入磁盘文件
+ * 使用先写临时文件再重命名的方式，防止写入失败时损坏原文件
+ * @param acc - 要保存的账号
+ * @returns error - 保存失败时返回错误（原文件不受影响）
+ */
+func (m *Manager) saveTokenToFile(acc *Account) error {
+	acc.mu.RLock()
+	tf := TokenFile{
+		IDToken:      acc.Token.IDToken,
+		AccessToken:  acc.Token.AccessToken,
+		RefreshToken: acc.Token.RefreshToken,
+		AccountID:    acc.Token.AccountID,
+		LastRefresh:  acc.LastRefreshedAt.Format(time.RFC3339),
+		Email:        acc.Token.Email,
+		Type:         "codex",
+		Expire:       acc.Token.Expire,
+	}
+	filePath := acc.FilePath
+	acc.mu.RUnlock()
+
+	data, err := json.MarshalIndent(tf, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化 Token 失败: %w", err)
+	}
+
+	if err = os.MkdirAll(filepath.Dir(filePath), 0700); err != nil {
+		return fmt.Errorf("创建目录失败: %w", err)
+	}
+
+	/* 原子写入：先写临时文件，成功后再重命名，避免写入失败损坏原文件 */
+	tmpPath := filePath + ".tmp"
+	if err = os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+
+	if err = os.Rename(tmpPath, filePath); err != nil {
+		/* 重命名失败时清理临时文件 */
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("重命名文件失败: %w", err)
+	}
+
+	return nil
+}
