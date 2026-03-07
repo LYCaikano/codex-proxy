@@ -596,6 +596,11 @@ func cleanCompactBody(body []byte, baseModel string) []byte {
 	result, _ = sjson.DeleteBytes(result, "store")
 	result, _ = sjson.DeleteBytes(result, "reasoning_effort")
 
+	/* Compact 端点要求 instructions 字段必须存在 */
+	if !gjson.GetBytes(result, "instructions").Exists() {
+		result, _ = sjson.SetBytes(result, "instructions", "")
+	}
+
 	return result
 }
 
