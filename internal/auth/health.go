@@ -179,7 +179,7 @@ func (hc *HealthChecker) checkAccount(ctx context.Context, manager *Manager, acc
 
 	/* 使用 responses 端点发送一个最小化的探测请求 */
 	checkURL := hc.baseURL + "/responses"
-	reqBody := `{"model":"gpt-5","input":[{"role":"user","content":"hi"}],"stream":false,"max_output_tokens":1}`
+	reqBody := `{"model":"gpt-5","input":[{"role":"user","content":"hi"}],"stream":false,"store":false}`
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, checkURL, strings.NewReader(reqBody))
 	if err != nil {

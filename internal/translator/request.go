@@ -86,6 +86,7 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		result, _ = sjson.DeleteBytes(result, "prompt_cache_retention")
 		result, _ = sjson.DeleteBytes(result, "safety_identifier")
 		result, _ = sjson.DeleteBytes(result, "generate")
+		result, _ = sjson.DeleteBytes(result, "max_output_tokens")
 
 		return result
 	}
