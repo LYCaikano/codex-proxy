@@ -1,13 +1,20 @@
 /**
- * 思考后缀解析模块
- * 使用连字符格式从模型名中提取思考配置
- * 格式：model-name-level，例如 gpt-5-xhigh、gpt-5-16384
+ * 思考后缀解析模块（逆向解析，不依赖模型白名单）
+ * 从模型名尾部向前逐个识别已知后缀并剥离，剩余部分即为真实模型名
  *
- * 解析逻辑：
- *   1. 先检查完整模型名是否为已知模型，如果是则不解析后缀
- *   2. 再从最后一个连字符分割，检查前半部分是否为已知模型 + 尾部是否为有效后缀
- *   3. 有效的思考级别：minimal, low, medium, high, xhigh, max, none, auto
- *   4. 有效的数字：正整数（作为 token 预算）、0（禁用）、-1（自动）
+ * 解析顺序（从右到左）：
+ *   1. -fast → 服务层级 service_tier="fast"
+ *   2. -high/-low/-medium 等 → 思考等级 reasoning.effort
+ *   3. -12345 → 数字 token 预算
+ *   4. 剩余部分 → 真实模型名（直接转发给上游）
+ *
+ * 示例：
+ *   - "gpt-5.4" → model="gpt-5.4"
+ *   - "gpt-5.4-high" → model="gpt-5.4", thinking=high
+ *   - "gpt-5.4-fast" → model="gpt-5.4", service_tier=fast
+ *   - "gpt-5.4-high-fast" → model="gpt-5.4", thinking=high, service_tier=fast
+ *   - "any-new-model-xhigh-fast" → model="any-new-model", thinking=xhigh, service_tier=fast
+ *   - "o4-mini-low" → model="o4-mini", thinking=low
  */
 package thinking
 
@@ -18,7 +25,7 @@ import (
 
 /**
  * validThinkingSuffixes 存储所有有效的思考级别后缀
- * 用于快速判断最后一段是否为思考配置
+ * 用于快速判断尾段是否为思考配置
  */
 var validThinkingSuffixes = map[string]bool{
 	"minimal": true,
@@ -32,117 +39,55 @@ var validThinkingSuffixes = map[string]bool{
 }
 
 /**
- * knownBaseModels 已知的基础模型名集合
- * 用于防止将模型名的一部分（如 gpt-5 中的 5）误判为思考后缀
- * 解析时：只有去掉尾部后剩余部分在此集合中，才认为尾部是思考后缀
- */
-var knownBaseModels = map[string]bool{
-	/* GPT-5 系列 */
-	"gpt-5": true, "gpt-5-codex": true, "gpt-5-codex-mini": true,
-	/* GPT-5.1 系列 */
-	"gpt-5.1": true, "gpt-5.1-codex": true, "gpt-5.1-codex-mini": true, "gpt-5.1-codex-max": true,
-	/* GPT-5.2 系列 */
-	"gpt-5.2": true, "gpt-5.2-codex": true,
-	/* GPT-5.3 系列 */
-	"gpt-5.3-codex": true, "gpt-5.3-codex-spark": true,
-	/* GPT-5.4 */
-	"gpt-5.4": true,
-	/* GPT-4.1 系列 */
-	"gpt-4.1": true, "gpt-4.1-mini": true, "gpt-4.1-nano": true,
-	/* o 系列 */
-	"o3": true, "o4-mini": true,
-	/* 旧版兼容 */
-	"codex-mini": true,
-}
-
-/**
- * ParseModelSuffix 从模型名中解析思考后缀（连字符格式）
- * 使用已知模型名列表防止误判（如 gpt-5 不会被解析为 gpt + budget=5）
+ * ParseModelSuffix 从模型名尾部逆向解析后缀
+ * 不依赖模型白名单，纯粹匹配已知后缀关键字
+ * 任何未识别的模型名都直接保留并转发给上游
  *
- * 解析流程：
- *   1. 完整模型名是已知模型 → 无后缀
- *   2. 去掉最后一段后是已知模型 + 最后一段是有效后缀 → 有后缀
- *   3. 其他情况 → 无后缀
- *
- * 示例：
- *   - "gpt-5" → ModelName="gpt-5", HasSuffix=false（已知模型，不拆分）
- *   - "gpt-5-xhigh" → ModelName="gpt-5", RawSuffix="xhigh"
- *   - "gpt-5-16384" → ModelName="gpt-5", RawSuffix="16384"
- *   - "gpt-5-codex-high" → ModelName="gpt-5-codex", RawSuffix="high"
- *
- * @param model - 原始模型名
+ * @param model - 原始模型名（可能包含思考后缀和/或 -fast 后缀）
  * @returns ParseResult - 解析结果
  */
 func ParseModelSuffix(model string) ParseResult {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return ParseResult{ModelName: model, HasSuffix: false}
+		return ParseResult{ModelName: model}
+	}
+
+	result := ParseResult{}
+
+	/*
+	 * 第一步：从右侧剥离 -fast（服务层级）
+	 */
+	lower := strings.ToLower(model)
+	if strings.HasSuffix(lower, "-fast") && len(model) > 5 {
+		result.IsFast = true
+		result.ServiceTier = "fast"
+		model = model[:len(model)-5]
 	}
 
 	/*
-	 * 0. 先检测 -fast 后缀（服务层级），与思考后缀独立
-	 *    支持组合：gpt-5.4-fast、gpt-5.4-high-fast
+	 * 第二步：从右侧剥离思考后缀（级别名或数字预算）
+	 * 找到最后一个连字符，检查尾段是否为已知思考后缀
 	 */
-	isFast := false
-	serviceTier := ""
-	if strings.HasSuffix(strings.ToLower(model), "-fast") {
-		isFast = true
-		serviceTier = "fast"
-		model = model[:len(model)-5] /* 剥离 "-fast" */
-	}
-
-	/* 1. 完整模型名就是已知模型，不做后缀解析 */
-	if knownBaseModels[strings.ToLower(model)] {
-		return ParseResult{ModelName: model, HasSuffix: false, IsFast: isFast, ServiceTier: serviceTier}
-	}
-
-	/* 2. 找到最后一个连字符的位置 */
 	lastDash := strings.LastIndex(model, "-")
-	if lastDash <= 0 || lastDash >= len(model)-1 {
-		return ParseResult{ModelName: model, HasSuffix: false, IsFast: isFast, ServiceTier: serviceTier}
-	}
+	if lastDash > 0 && lastDash < len(model)-1 {
+		tail := strings.ToLower(model[lastDash+1:])
 
-	suffix := strings.ToLower(model[lastDash+1:])
-	modelName := model[:lastDash]
-
-	/* 3. 前半部分必须是已知模型，才认为后半部分是思考后缀 */
-	if !knownBaseModels[strings.ToLower(modelName)] {
-		return ParseResult{ModelName: model, HasSuffix: false, IsFast: isFast, ServiceTier: serviceTier}
-	}
-
-	/* 4. 检查是否为有效的思考级别 */
-	if validThinkingSuffixes[suffix] {
-		return ParseResult{
-			ModelName:   modelName,
-			HasSuffix:   true,
-			RawSuffix:   suffix,
-			IsFast:      isFast,
-			ServiceTier: serviceTier,
+		if validThinkingSuffixes[tail] {
+			/* 匹配到思考级别后缀 */
+			result.HasSuffix = true
+			result.RawSuffix = tail
+			model = model[:lastDash]
+		} else if _, err := strconv.Atoi(tail); err == nil {
+			/* 匹配到数字（token 预算） */
+			result.HasSuffix = true
+			result.RawSuffix = tail
+			model = model[:lastDash]
 		}
 	}
 
-	/* 5. 检查是否为数字（token 预算） */
-	if _, err := strconv.Atoi(suffix); err == nil {
-		return ParseResult{
-			ModelName:   modelName,
-			HasSuffix:   true,
-			RawSuffix:   suffix,
-			IsFast:      isFast,
-			ServiceTier: serviceTier,
-		}
-	}
-
-	/* 不是有效的思考后缀，原样返回 */
-	return ParseResult{ModelName: model, HasSuffix: false, IsFast: isFast, ServiceTier: serviceTier}
-}
-
-/**
- * RegisterBaseModel 动态注册已知基础模型名
- * 允许在运行时添加新模型，无需修改代码
- * @param modelName - 模型名（不区分大小写）
- */
-func RegisterBaseModel(modelName string) {
-	knownBaseModels[strings.ToLower(modelName)] = true
+	/* 剩余部分即为真实模型名 */
+	result.ModelName = model
+	return result
 }
 
 /**
