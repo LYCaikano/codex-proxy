@@ -105,6 +105,8 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
+	r.Use(handler.CORSAllowOrigin())
+	r.Use(handler.OptionsBypass())
 	r.Use(gin.Recovery())
 	r.Use(ginLogger())
 
