@@ -95,7 +95,12 @@ func main() {
 	}
 
 	/* 初始化执行器 */
-	exec := executor.NewExecutor(cfg.BaseURL, cfg.ProxyURL)
+	exec := executor.NewExecutor(cfg.BaseURL, cfg.ProxyURL, executor.HTTPPoolConfig{
+		MaxConnsPerHost:     cfg.MaxConnsPerHost,
+		MaxIdleConns:        cfg.MaxIdleConns,
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+		EnableHTTP2:         cfg.EnableHTTP2,
+	})
 
 	/* 启动连接池保活（防止长时间无请求后首次请求耗时过长） */
 	exec.StartKeepAlive(ctx)

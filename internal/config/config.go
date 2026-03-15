@@ -36,6 +36,10 @@ type Config struct {
 	HealthCheckMaxFailures int      `yaml:"health-check-max-failures"`
 	HealthCheckConcurrency int      `yaml:"health-check-concurrency"`
 	RefreshConcurrency     int      `yaml:"refresh-concurrency"`
+	MaxConnsPerHost        int      `yaml:"max-conns-per-host"`
+	MaxIdleConns           int      `yaml:"max-idle-conns"`
+	MaxIdleConnsPerHost    int      `yaml:"max-idle-conns-per-host"`
+	EnableHTTP2            bool     `yaml:"enable-http2"`
 	Accounts               []string `yaml:"accounts"`
 	APIKeys                []string `yaml:"api-keys"`
 }
@@ -63,6 +67,10 @@ func LoadConfig(path string) (*Config, error) {
 		HealthCheckMaxFailures: 3,
 		HealthCheckConcurrency: 5,
 		RefreshConcurrency:     50,
+		MaxConnsPerHost:        512,
+		MaxIdleConns:           1024,
+		MaxIdleConnsPerHost:    512,
+		EnableHTTP2:            false,
 	}
 
 	if err = yaml.Unmarshal(data, cfg); err != nil {
@@ -110,6 +118,15 @@ func (c *Config) Sanitize() {
 	}
 	if c.RefreshConcurrency <= 0 {
 		c.RefreshConcurrency = 50
+	}
+	if c.MaxConnsPerHost < 0 {
+		c.MaxConnsPerHost = 0
+	}
+	if c.MaxIdleConns < 0 {
+		c.MaxIdleConns = 0
+	}
+	if c.MaxIdleConnsPerHost < 0 {
+		c.MaxIdleConnsPerHost = 0
 	}
 
 	switch c.LogLevel {

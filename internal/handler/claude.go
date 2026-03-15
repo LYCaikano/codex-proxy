@@ -8,6 +8,7 @@ package handler
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,6 +101,9 @@ func (h *ProxyHandler) executeClaudeStream(c *gin.Context, rc executor.RetryConf
 		log.Errorf("Claude 读取流式响应失败: %v", scanErr)
 		return scanErr
 	}
+	if !state.HasText && !state.HasToolUse {
+		return executor.ErrEmptyResponse
+	}
 
 	account.RecordSuccess()
 	return nil
@@ -132,13 +136,16 @@ func (h *ProxyHandler) executeClaudeNonStream(c *gin.Context, rc executor.RetryC
 		return fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	result := translator.ConvertCodexFullSSEToClaudeResponse(c.Request.Context(), data, model)
-	if result == "" {
+	result := translator.ConvertCodexFullSSEToClaudeResponseWithMeta(c.Request.Context(), data, model)
+	if !result.FoundCompleted || result.JSON == "" {
 		return fmt.Errorf("未收到 response.completed 事件")
+	}
+	if !result.HasText && !result.HasToolUse {
+		return executor.ErrEmptyResponse
 	}
 
 	account.RecordSuccess()
-	c.Data(http.StatusOK, "application/json", []byte(result))
+	c.Data(http.StatusOK, "application/json", []byte(result.JSON))
 	return nil
 }
 
@@ -148,6 +155,10 @@ func (h *ProxyHandler) executeClaudeNonStream(c *gin.Context, rc executor.RetryC
  * @param err - executor 返回的错误
  */
 func handleClaudeExecutorError(c *gin.Context, err error) {
+	if errors.Is(err, executor.ErrEmptyResponse) {
+		sendClaudeError(c, http.StatusBadRequest, "invalid_response", "empty response")
+		return
+	}
 	if statusErr, ok := err.(*executor.StatusError); ok {
 		sendClaudeError(c, statusErr.Code, "api_error", string(statusErr.Body))
 		return

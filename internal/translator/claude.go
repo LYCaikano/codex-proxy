@@ -277,6 +277,7 @@ type ClaudeStreamState struct {
 	InputTokens       int64
 	ContentBlockIndex int
 	HasStartedContent bool
+	HasText           bool
 	HasToolUse        bool
 }
 
@@ -344,6 +345,7 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 		if delta == "" {
 			return nil
 		}
+		state.HasText = true
 
 		/* 如果还没开始内容块，先发 content_block_start */
 		if !state.HasStartedContent {
@@ -529,6 +531,56 @@ func ConvertCodexNonStreamToClaudeResponse(_ context.Context, rawJSON []byte, mo
 	return out
 }
 
+type ClaudeNonStreamResult struct {
+	JSON           string
+	FoundCompleted bool
+	HasText        bool
+	HasToolUse     bool
+}
+
+func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byte, model string) ClaudeNonStreamResult {
+	lines := bytes.Split(data, []byte("\n"))
+	for _, line := range lines {
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		jsonData := bytes.TrimSpace(line[5:])
+		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
+			continue
+		}
+
+		hasText := false
+		hasToolUse := false
+		output := gjson.GetBytes(jsonData, "response.output")
+		if output.IsArray() {
+			for _, item := range output.Array() {
+				switch item.Get("type").String() {
+				case "message":
+					content := item.Get("content")
+					if content.IsArray() {
+						for _, ci := range content.Array() {
+							if ci.Get("type").String() == "output_text" && ci.Get("text").String() != "" {
+								hasText = true
+								break
+							}
+						}
+					}
+				case "function_call":
+					hasToolUse = true
+				}
+			}
+		}
+
+		return ClaudeNonStreamResult{
+			JSON:           ConvertCodexNonStreamToClaudeResponse(ctx, jsonData, model),
+			FoundCompleted: true,
+			HasText:        hasText,
+			HasToolUse:     hasToolUse,
+		}
+	}
+	return ClaudeNonStreamResult{}
+}
+
 /**
  * ConvertCodexFullSSEToClaudeResponse 从完整 SSE 数据中提取 response.completed 并转为 Claude 格式
  * 用于非流式场景（Codex 始终返回 SSE，需要从中提取最终结果）
@@ -539,18 +591,7 @@ func ConvertCodexNonStreamToClaudeResponse(_ context.Context, rawJSON []byte, mo
  * @returns string - Claude Messages API 格式的 JSON 字符串
  */
 func ConvertCodexFullSSEToClaudeResponse(ctx context.Context, data []byte, model string) string {
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		jsonData := bytes.TrimSpace(line[5:])
-		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
-			continue
-		}
-		return ConvertCodexNonStreamToClaudeResponse(ctx, jsonData, model)
-	}
-	return ""
+	return ConvertCodexFullSSEToClaudeResponseWithMeta(ctx, data, model).JSON
 }
 
 /**

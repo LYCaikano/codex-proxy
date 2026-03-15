@@ -6,19 +6,34 @@
 package handler
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"codex-proxy/internal/auth"
 	"codex-proxy/internal/executor"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
+
+var responsesWSUpgrader = websocket.Upgrader{
+	ReadBufferSize:  32 * 1024,
+	WriteBufferSize: 32 * 1024,
+	CheckOrigin: func(_ *http.Request) bool {
+		return true
+	},
+}
 
 /**
  * ProxyHandler 代理处理器
@@ -215,6 +230,10 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
  * @param err - executor 返回的错误
  */
 func handleExecutorError(c *gin.Context, err error) {
+	if errors.Is(err, executor.ErrEmptyResponse) {
+		sendError(c, http.StatusBadRequest, "empty response", "invalid_response")
+		return
+	}
 	if statusErr, ok := err.(*executor.StatusError); ok {
 		c.JSON(statusErr.Code, gin.H{
 			"error": gin.H{
@@ -349,6 +368,11 @@ func writeSSEProgress(c *gin.Context, ch <-chan auth.ProgressEvent) {
  * 重试逻辑在 executor 内部完成
  */
 func (h *ProxyHandler) handleResponses(c *gin.Context) {
+	if websocket.IsWebSocketUpgrade(c.Request) {
+		h.handleResponsesWS(c)
+		return
+	}
+
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		sendError(c, http.StatusBadRequest, "读取请求体失败", "invalid_request_error")
@@ -378,6 +402,140 @@ func (h *ProxyHandler) handleResponses(c *gin.Context) {
 		}
 		c.Data(http.StatusOK, "application/json", result)
 	}
+}
+
+func (h *ProxyHandler) handleResponsesWS(c *gin.Context) {
+	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Warnf("responses ws upgrade 失败: %v", err)
+		return
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	inProgress := false
+	for {
+		msgType, message, readErr := conn.ReadMessage()
+		if readErr != nil {
+			return
+		}
+		if msgType != websocket.TextMessage {
+			h.writeWSError(conn, "invalid_request_error", "仅支持文本帧")
+			continue
+		}
+
+		eventType := gjson.GetBytes(message, "type").String()
+		switch eventType {
+		case "response.create":
+			if inProgress {
+				h.writeWSError(conn, "invalid_request_error", "同一连接不允许并发 response.create")
+				continue
+			}
+
+			respObj := gjson.GetBytes(message, "response")
+			if !respObj.Exists() {
+				h.writeWSError(conn, "invalid_request_error", "缺少 response 字段")
+				continue
+			}
+
+			requestBody := []byte(respObj.Raw)
+			requestBody, _ = sjson.SetBytes(requestBody, "stream", true)
+
+			model := gjson.GetBytes(requestBody, "model").String()
+			if model == "" {
+				h.writeWSError(conn, "invalid_request_error", "缺少 model 字段")
+				continue
+			}
+
+			inProgress = true
+			log.Infof("responses ws: 上游 WS 不可用或未启用，回退 HTTP/SSE 转发")
+			rc := h.buildRetryConfig()
+			streamErr := h.forwardResponsesSSEAsWS(c.Request.Context(), conn, rc, requestBody, model)
+			inProgress = false
+			if streamErr != nil {
+				if errors.Is(streamErr, executor.ErrEmptyResponse) {
+					h.writeWSError(conn, "invalid_response", "empty response")
+					_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "empty response"), time.Now().Add(2*time.Second))
+					return
+				}
+				h.writeWSError(conn, "api_error", streamErr.Error())
+				return
+			}
+			return
+
+		case "response.cancel", "response.close":
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closed"), time.Now().Add(2*time.Second))
+			return
+
+		default:
+			h.writeWSError(conn, "invalid_request_error", "不支持的事件类型")
+		}
+	}
+}
+
+func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websocket.Conn, rc executor.RetryConfig, requestBody []byte, model string) error {
+	startTotal := time.Now()
+	rawResp, account, attempts, baseModel, convertDur, sendDur, err := h.executor.OpenResponsesStream(ctx, rc, requestBody, model)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rawResp.Body != nil {
+			_ = rawResp.Body.Close()
+		}
+	}()
+
+	hasText := false
+	hasTool := false
+
+	scanner := bufio.NewScanner(rawResp.Body)
+	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[5:])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+
+		typ := gjson.GetBytes(payload, "type").String()
+		switch typ {
+		case "response.output_text.delta":
+			if gjson.GetBytes(payload, "delta").String() != "" {
+				hasText = true
+			}
+		case "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done":
+			hasTool = true
+		}
+
+		if writeErr := conn.WriteMessage(websocket.TextMessage, payload); writeErr != nil {
+			return writeErr
+		}
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+		return scanErr
+	}
+
+	if !hasText && !hasTool {
+		log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+		return executor.ErrEmptyResponse
+	}
+
+	account.RecordSuccess()
+	log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+	return nil
+}
+
+func (h *ProxyHandler) writeWSError(conn *websocket.Conn, errType, message string) {
+	errBody := `{"type":"error","error":{"type":"","message":""}}`
+	errBody, _ = sjson.Set(errBody, "error.type", errType)
+	errBody, _ = sjson.Set(errBody, "error.message", message)
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(errBody))
 }
 
 /**

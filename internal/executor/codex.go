@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,10 +38,18 @@ const (
 
 /* 预分配 SSE 输出字节片段，避免每次事件的内存分配 */
 var (
-	sseDataPrefix = []byte("data: ")
-	sseDataSuffix = []byte("\n\n")
-	sseDoneMarker = []byte("data: [DONE]\n\n")
+	sseDataPrefix    = []byte("data: ")
+	sseDataSuffix    = []byte("\n\n")
+	sseDoneMarker    = []byte("data: [DONE]\n\n")
+	ErrEmptyResponse = errors.New("empty response")
 )
+
+type HTTPPoolConfig struct {
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	MaxConnsPerHost     int
+	EnableHTTP2         bool
+}
 
 /**
  * Executor Codex 请求执行器
@@ -61,10 +70,23 @@ type Executor struct {
  * @param proxyURL - 代理地址
  * @returns *Executor - 执行器实例
  */
-func NewExecutor(baseURL, proxyURL string) *Executor {
+func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
+	maxIdleConns := poolCfg.MaxIdleConns
+	if maxIdleConns < 0 {
+		maxIdleConns = 0
+	}
+	maxIdleConnsPerHost := poolCfg.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost < 0 {
+		maxIdleConnsPerHost = 0
+	}
+	maxConnsPerHost := poolCfg.MaxConnsPerHost
+	if maxConnsPerHost < 0 {
+		maxConnsPerHost = 0
+	}
+	enableHTTP2 := poolCfg.EnableHTTP2
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 60 * time.Second,
@@ -72,19 +94,21 @@ func NewExecutor(baseURL, proxyURL string) *Executor {
 
 	transport := &http.Transport{
 		DialContext:           dialer.DialContext,
-		MaxIdleConns:          1024,
-		MaxIdleConnsPerHost:   512,
-		MaxConnsPerHost:       512, /* 上限避免无限建连导致端口耗尽和队列拥堵 */
+		MaxIdleConns:          maxIdleConns,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 20 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		WriteBufferSize:       32 * 1024,
 		ReadBufferSize:        32 * 1024,
-		ForceAttemptHTTP2:     false,                                                  /* 禁用 HTTP/2，避免同一连接上的流量拥塞影响长 SSE */
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, /* 彻底禁用 HTTP/2 */
-		DisableCompression:    true,                                                   /* SSE 流不需要 gzip 解压开销 */
+		ForceAttemptHTTP2:     enableHTTP2,
+		DisableCompression:    true, /* SSE 流不需要 gzip 解压开销 */
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
+	}
+	if !enableHTTP2 {
+		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	}
 
 	if proxyURL != "" {
@@ -287,6 +311,10 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return err
 	}
+	if !state.HasText && !state.HasToolCall {
+		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+		return ErrEmptyResponse
+	}
 
 	_, _ = writer.Write(sseDoneMarker)
 	if canFlush {
@@ -352,7 +380,11 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 				usage.Get("total_tokens").Int(),
 			)
 		}
-		result := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
+		result, hasOutput := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
+		if !hasOutput {
+			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+			return nil, ErrEmptyResponse
+		}
 		if result != "" {
 			account.RecordSuccess()
 			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
@@ -493,6 +525,23 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 	return nil, fmt.Errorf("未收到 response.completed 事件")
 }
 
+func (e *Executor) OpenResponsesStream(ctx context.Context, rc RetryConfig, requestBody []byte, model string) (*RawResponse, *auth.Account, int, string, time.Duration, time.Duration, error) {
+	convertStart := time.Now()
+	body, baseModel := thinking.ApplyThinking(requestBody, model)
+	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
+	convertDur := time.Since(convertStart)
+	apiURL := e.baseURL + "/responses"
+
+	sendStart := time.Now()
+	httpResp, account, attempts, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	if err != nil {
+		return nil, nil, 0, "", 0, 0, err
+	}
+	sendDur := time.Since(sendStart)
+
+	return &RawResponse{StatusCode: httpResp.StatusCode, Body: httpResp.Body}, account, attempts, baseModel, convertDur, sendDur, nil
+}
+
 /**
  * ExecuteResponsesCompactStream 执行 Responses Compact API 流式请求（内部重试）
  * 使用 /responses/compact 端点，直接透传 Codex SSE 事件到客户端
@@ -574,6 +623,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 	if err != nil {
 		return nil, err
 	}
+	sendDur := time.Since(sendStart)
 	defer func() {
 		_ = httpResp.Body.Close()
 	}()
@@ -660,7 +710,7 @@ func (e *Executor) ExecuteRawCodexStream(ctx context.Context, rc RetryConfig, re
 	codexBody := translator.ConvertOpenAIRequestToCodex(baseModel, body, true)
 	apiURL := e.baseURL + "/responses"
 
-	httpResp, account, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
+	httpResp, account, _, err := e.sendWithRetry(ctx, rc, model, apiURL, codexBody, true)
 	if err != nil {
 		return nil, nil, err
 	}

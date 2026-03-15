@@ -35,6 +35,8 @@ type StreamState struct {
 	CreatedAt            int64
 	Model                string
 	FunctionCallIndex    int
+	HasText              bool
+	HasToolCall          bool
 	HasReceivedArgsDelta bool
 	HasToolCallAnnounced bool
 	baseTpl              string
@@ -123,6 +125,9 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 
 	case "response.output_text.delta":
 		if delta := root.Get("delta"); delta.Exists() {
+			if delta.String() != "" {
+				state.HasText = true
+			}
 			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
 			tpl, _ = sjson.Set(tpl, "choices.0.delta.content", delta.String())
 		}
@@ -161,6 +166,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		if !item.Exists() || item.Get("type").String() != "function_call" {
 			return nil
 		}
+		state.HasToolCall = true
 		state.FunctionCallIndex++
 		state.HasReceivedArgsDelta = false
 		state.HasToolCallAnnounced = true
@@ -180,6 +186,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.tool_calls.-1", fc)
 
 	case "response.function_call_arguments.delta":
+		state.HasToolCall = true
 		state.HasReceivedArgsDelta = true
 		fc := `{"index":0,"function":{"arguments":""}}`
 		fc, _ = sjson.Set(fc, "index", state.FunctionCallIndex)
@@ -188,6 +195,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		tpl, _ = sjson.SetRaw(tpl, "choices.0.delta.tool_calls.-1", fc)
 
 	case "response.function_call_arguments.done":
+		state.HasToolCall = true
 		if state.HasReceivedArgsDelta {
 			return nil
 		}
@@ -202,6 +210,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		if !item.Exists() || item.Get("type").String() != "function_call" {
 			return nil
 		}
+		state.HasToolCall = true
 		if state.HasToolCallAnnounced {
 			state.HasToolCallAnnounced = false
 			return nil
@@ -235,10 +244,10 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
  * @param reverseToolMap - 缩短名→原始名的工具名映射
  * @returns string - OpenAI Chat Completions 格式的 JSON 字符串
  */
-func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap map[string]string) string {
+func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap map[string]string) (string, bool) {
 	root := gjson.ParseBytes(rawJSON)
 	if root.Get("type").String() != "response.completed" {
-		return ""
+		return "", false
 	}
 
 	resp := root.Get("response")
@@ -278,6 +287,7 @@ func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap 
 
 	/* 处理 output 数组 */
 	output := resp.Get("output")
+	hasOutput := false
 	if output.IsArray() {
 		var contentText, reasoningText string
 		var toolCalls []string
@@ -322,12 +332,14 @@ func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap 
 		}
 
 		if contentText != "" {
+			hasOutput = true
 			tpl, _ = sjson.Set(tpl, "choices.0.message.content", contentText)
 		}
 		if reasoningText != "" {
 			tpl, _ = sjson.Set(tpl, "choices.0.message.reasoning_content", reasoningText)
 		}
 		if len(toolCalls) > 0 {
+			hasOutput = true
 			tpl, _ = sjson.SetRaw(tpl, "choices.0.message.tool_calls", `[]`)
 			for _, tc := range toolCalls {
 				tpl, _ = sjson.SetRaw(tpl, "choices.0.message.tool_calls.-1", tc)
@@ -340,5 +352,5 @@ func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap 
 		tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "stop")
 	}
 
-	return tpl
+	return tpl, hasOutput
 }
