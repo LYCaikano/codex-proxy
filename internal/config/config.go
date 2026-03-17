@@ -26,29 +26,44 @@ import (
  * @field APIKeys - 可选的 API 访问密钥，用于保护代理服务
  */
 type Config struct {
-	Listen                 string   `yaml:"listen"`
-	AuthDir                string   `yaml:"auth-dir"`
-	ProxyURL               string   `yaml:"proxy-url"`
-	BackendDomain          string   `yaml:"backend-domain"`
-	BackendResolveAddress  string   `yaml:"backend-resolve-address"`
-	BaseURL                string   `yaml:"base-url"`
-	LogLevel               string   `yaml:"log-level"`
-	RefreshInterval        int      `yaml:"refresh-interval"`
-	MaxRetry               int      `yaml:"max-retry"`
-	HealthCheckInterval    int      `yaml:"health-check-interval"`
-	HealthCheckMaxFailures int      `yaml:"health-check-max-failures"`
-	HealthCheckConcurrency int      `yaml:"health-check-concurrency"`
-	HealthCheckStartDelay  int      `yaml:"health-check-start-delay"`
-	HealthCheckBatchSize   int      `yaml:"health-check-batch-size"`
-	HealthCheckReqTimeout  int      `yaml:"health-check-request-timeout"`
-	RefreshConcurrency     int      `yaml:"refresh-concurrency"`
-	MaxConnsPerHost        int      `yaml:"max-conns-per-host"`
-	MaxIdleConns           int      `yaml:"max-idle-conns"`
-	MaxIdleConnsPerHost    int      `yaml:"max-idle-conns-per-host"`
-	EnableHTTP2            bool     `yaml:"enable-http2"`
-	StartupAsyncLoad       bool     `yaml:"startup-async-load"`
-	Accounts               []string `yaml:"accounts"`
-	APIKeys                []string `yaml:"api-keys"`
+	Listen                   string   `yaml:"listen"`
+	AuthDir                  string   `yaml:"auth-dir"`
+	ProxyURL                 string   `yaml:"proxy-url"`
+	BackendDomain            string   `yaml:"backend-domain"`
+	BackendResolveAddress    string   `yaml:"backend-resolve-address"`
+	BaseURL                  string   `yaml:"base-url"`
+	LogLevel                 string   `yaml:"log-level"`
+	RefreshInterval          int      `yaml:"refresh-interval"`
+	MaxRetry                 int      `yaml:"max-retry"`
+	HealthCheckInterval      int      `yaml:"health-check-interval"`
+	HealthCheckMaxFailures   int      `yaml:"health-check-max-failures"`
+	HealthCheckConcurrency   int      `yaml:"health-check-concurrency"`
+	HealthCheckStartDelay    int      `yaml:"health-check-start-delay"`
+	HealthCheckBatchSize     int      `yaml:"health-check-batch-size"`
+	HealthCheckReqTimeout    int      `yaml:"health-check-request-timeout"`
+	RefreshConcurrency       int      `yaml:"refresh-concurrency"`
+	MaxConnsPerHost          int      `yaml:"max-conns-per-host"`
+	MaxIdleConns             int      `yaml:"max-idle-conns"`
+	MaxIdleConnsPerHost      int      `yaml:"max-idle-conns-per-host"`
+	EnableHTTP2              bool     `yaml:"enable-http2"`
+	StartupAsyncLoad         bool     `yaml:"startup-async-load"`
+	StartupLoadRetryInterval int      `yaml:"startup-load-retry-interval"`
+	ShutdownTimeout          int      `yaml:"shutdown-timeout"`
+	AuthScanInterval         int      `yaml:"auth-scan-interval"`
+	SaveWorkers              int      `yaml:"save-workers"`
+	Cooldown401Sec           int      `yaml:"cooldown-401-sec"`
+	Cooldown429Sec           int      `yaml:"cooldown-429-sec"`
+	RefreshSingleTimeoutSec  int      `yaml:"refresh-single-timeout-sec"`
+	QuotaCheckConcurrency    int      `yaml:"quota-check-concurrency"`
+	KeepaliveInterval        int      `yaml:"keepalive-interval"`
+	UpstreamTimeoutSec       int      `yaml:"upstream-timeout-sec"`
+	StreamIdleTimeoutSec     int      `yaml:"stream-idle-timeout-sec"`
+	EmptyRetryMax            int      `yaml:"empty-retry-max"`
+	EnableStreamIdleRetry    bool     `yaml:"enable-stream-idle-retry"`
+	Selector                 string   `yaml:"selector"`
+	RefreshBatchSize         int      `yaml:"refresh-batch-size"`
+	Accounts                 []string `yaml:"accounts"`
+	APIKeys                  []string `yaml:"api-keys"`
 }
 
 /**
@@ -64,25 +79,40 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Listen:                 ":8080",
-		AuthDir:                "./auths",
-		BackendDomain:          "",
-		BaseURL:                "",
-		LogLevel:               "info",
-		RefreshInterval:        3000,
-		MaxRetry:               2,
-		HealthCheckInterval:    300,
-		HealthCheckMaxFailures: 3,
-		HealthCheckConcurrency: 5,
-		HealthCheckStartDelay:  45,
-		HealthCheckBatchSize:   20,
-		HealthCheckReqTimeout:  8,
-		RefreshConcurrency:     50,
-		MaxConnsPerHost:        512,
-		MaxIdleConns:           1024,
-		MaxIdleConnsPerHost:    512,
-		EnableHTTP2:            true,
-		StartupAsyncLoad:       true,
+		Listen:                   ":8080",
+		AuthDir:                  "./auths",
+		BackendDomain:            "",
+		BaseURL:                  "",
+		LogLevel:                 "info",
+		RefreshInterval:          3000,
+		MaxRetry:                 2,
+		HealthCheckInterval:      300,
+		HealthCheckMaxFailures:   3,
+		HealthCheckConcurrency:   5,
+		HealthCheckStartDelay:    45,
+		HealthCheckBatchSize:     20,
+		HealthCheckReqTimeout:    8,
+		RefreshConcurrency:       50,
+		MaxConnsPerHost:          512,
+		MaxIdleConns:             1024,
+		MaxIdleConnsPerHost:      512,
+		EnableHTTP2:              true,
+		StartupAsyncLoad:         true,
+		StartupLoadRetryInterval: 10,
+		ShutdownTimeout:          5,
+		AuthScanInterval:         30,
+		SaveWorkers:              4,
+		Cooldown401Sec:           30,
+		Cooldown429Sec:           60,
+		RefreshSingleTimeoutSec:  30,
+		QuotaCheckConcurrency:    0, /* 0 表示使用 refresh-concurrency */
+		KeepaliveInterval:        60,
+		UpstreamTimeoutSec:       0,
+		StreamIdleTimeoutSec:     0,
+		EmptyRetryMax:            2,
+		EnableStreamIdleRetry:    true,
+		Selector:                 "round-robin",
+		RefreshBatchSize:         0,
 	}
 
 	if err = yaml.Unmarshal(data, cfg); err != nil {
@@ -168,6 +198,58 @@ func (c *Config) Sanitize() {
 	}
 	if c.MaxIdleConnsPerHost < 0 {
 		c.MaxIdleConnsPerHost = 0
+	}
+	if c.StartupLoadRetryInterval <= 0 {
+		c.StartupLoadRetryInterval = 10
+	}
+	if c.ShutdownTimeout < 1 {
+		c.ShutdownTimeout = 5
+	}
+	if c.ShutdownTimeout > 60 {
+		c.ShutdownTimeout = 60
+	}
+	if c.AuthScanInterval <= 0 {
+		c.AuthScanInterval = 30
+	}
+	if c.SaveWorkers < 1 {
+		c.SaveWorkers = 4
+	}
+	if c.SaveWorkers > 32 {
+		c.SaveWorkers = 32
+	}
+	if c.Cooldown401Sec <= 0 {
+		c.Cooldown401Sec = 30
+	}
+	if c.Cooldown429Sec <= 0 {
+		c.Cooldown429Sec = 60
+	}
+	if c.RefreshSingleTimeoutSec <= 0 {
+		c.RefreshSingleTimeoutSec = 30
+	}
+	if c.QuotaCheckConcurrency < 0 {
+		c.QuotaCheckConcurrency = 0
+	}
+	if c.QuotaCheckConcurrency == 0 {
+		c.QuotaCheckConcurrency = c.RefreshConcurrency
+	}
+	if c.KeepaliveInterval <= 0 {
+		c.KeepaliveInterval = 60
+	}
+	if c.UpstreamTimeoutSec < 0 {
+		c.UpstreamTimeoutSec = 0
+	}
+	if c.StreamIdleTimeoutSec < 0 {
+		c.StreamIdleTimeoutSec = 0
+	}
+	if c.EmptyRetryMax < 0 {
+		c.EmptyRetryMax = 0
+	}
+	if c.RefreshBatchSize < 0 {
+		c.RefreshBatchSize = 0
+	}
+	c.Selector = strings.TrimSpace(strings.ToLower(c.Selector))
+	if c.Selector != "quota-first" {
+		c.Selector = "round-robin"
 	}
 
 	switch c.LogLevel {

@@ -117,6 +117,34 @@ func (s *RoundRobinSelector) getOrRefreshCache(accounts []*Account) []*Account {
 }
 
 /**
+ * QuotaFirstSelector 额度优先选择器
+ * 每次请求选择剩余额度最高（used_percent 最低）的可用账号
+ * 适合希望尽量打满单账号额度的场景
+ */
+type QuotaFirstSelector struct{}
+
+/**
+ * NewQuotaFirstSelector 创建新的额度优先选择器
+ */
+func NewQuotaFirstSelector() *QuotaFirstSelector {
+	return &QuotaFirstSelector{}
+}
+
+/**
+ * Pick 选择剩余额度最高的可用账号
+ */
+func (s *QuotaFirstSelector) Pick(model string, accounts []*Account) (*Account, error) {
+	available := filterAvailable(accounts)
+	if len(available) == 0 {
+		return nil, fmt.Errorf("没有可用的 Codex 账号")
+	}
+	if len(available) > 1 {
+		sortByUsedPercent(available)
+	}
+	return available[0], nil
+}
+
+/**
  * FillFirstSelector 填充优先选择器
  * 始终优先使用第一个可用账号，直到该账号进入冷却后再切换
  * 适合需要消耗单个账号配额上限的场景

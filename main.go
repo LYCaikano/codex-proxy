@@ -65,8 +65,21 @@ func main() {
 	}
 
 	/* 初始化账号管理器 */
-	selector := auth.NewRoundRobinSelector()
-	manager := auth.NewManager(cfg.AuthDir, cfg.ProxyURL, cfg.RefreshInterval, selector, cfg.EnableHTTP2)
+	var selector auth.Selector
+	if cfg.Selector == "quota-first" {
+		selector = auth.NewQuotaFirstSelector()
+	} else {
+		selector = auth.NewRoundRobinSelector()
+	}
+	managerOpts := &auth.ManagerOptions{
+		AuthScanInterval:        cfg.AuthScanInterval,
+		SaveWorkers:             cfg.SaveWorkers,
+		Cooldown401Sec:          cfg.Cooldown401Sec,
+		Cooldown429Sec:          cfg.Cooldown429Sec,
+		RefreshSingleTimeoutSec: cfg.RefreshSingleTimeoutSec,
+		RefreshBatchSize:        cfg.RefreshBatchSize,
+	}
+	manager := auth.NewManager(cfg.AuthDir, cfg.ProxyURL, cfg.RefreshInterval, selector, cfg.EnableHTTP2, managerOpts)
 	manager.SetRefreshConcurrency(cfg.RefreshConcurrency)
 
 	/* 启动后台任务 */
@@ -82,11 +95,15 @@ func main() {
 					return
 				}
 				if loadErr := manager.LoadAccounts(); loadErr != nil {
-					log.Warnf("后台加载账号失败: %v，10 秒后重试", loadErr)
+					retrySec := cfg.StartupLoadRetryInterval
+					if retrySec < 1 {
+						retrySec = 10
+					}
+					log.Warnf("后台加载账号失败: %v，%d 秒后重试", loadErr, retrySec)
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(10 * time.Second):
+					case <-time.After(time.Duration(retrySec) * time.Second):
 					}
 					continue
 				}
@@ -127,12 +144,13 @@ func main() {
 
 	/* 初始化执行器 */
 	exec := executor.NewExecutor(cfg.BaseURL, cfg.ProxyURL, executor.HTTPPoolConfig{
-		MaxConnsPerHost:     cfg.MaxConnsPerHost,
-		MaxIdleConns:        cfg.MaxIdleConns,
-		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
-		EnableHTTP2:         cfg.EnableHTTP2,
-		BackendDomain:       cfg.BackendDomain,
-		ResolveAddress:      cfg.BackendResolveAddress,
+		MaxConnsPerHost:      cfg.MaxConnsPerHost,
+		MaxIdleConns:         cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:  cfg.MaxIdleConnsPerHost,
+		EnableHTTP2:          cfg.EnableHTTP2,
+		BackendDomain:        cfg.BackendDomain,
+		ResolveAddress:       cfg.BackendResolveAddress,
+		KeepaliveIntervalSec: cfg.KeepaliveInterval,
 	})
 
 	/* 启动连接池保活（防止长时间无请求后首次请求耗时过长） */
@@ -150,7 +168,7 @@ func main() {
 	r.Use(ginLogger())
 
 	/* 注册路由 */
-	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, indexHTML)
+	proxyHandler := handler.NewProxyHandler(manager, exec, cfg.APIKeys, cfg.MaxRetry, cfg.ProxyURL, cfg.BaseURL, cfg.EnableHTTP2, cfg.BackendDomain, cfg.BackendResolveAddress, cfg.QuotaCheckConcurrency, cfg.UpstreamTimeoutSec, cfg.EmptyRetryMax, cfg.StreamIdleTimeoutSec, cfg.EnableStreamIdleRetry, indexHTML)
 	proxyHandler.RegisterRoutes(r)
 
 	/* 使用 http.Server 以支持优雅关闭 */
@@ -177,8 +195,12 @@ func main() {
 
 	log.Infof("%s收到关闭信号，正在停止...%s", colorYellow, colorReset)
 
-	/* 优雅关闭 HTTP 服务器（最多等 5 秒） */
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	/* 优雅关闭 HTTP 服务器 */
+	shutdownSec := cfg.ShutdownTimeout
+	if shutdownSec < 1 {
+		shutdownSec = 5
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(shutdownSec)*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {

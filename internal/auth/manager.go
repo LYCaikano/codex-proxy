@@ -15,11 +15,27 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-/* 并发刷新默认配置 */
+/* 并发刷新与运维默认配置 */
 const (
-	defaultRefreshConcurrency = 50
-	defaultScanInterval       = 30
+	defaultRefreshConcurrency      = 50
+	defaultScanInterval            = 30
+	defaultSaveWorkers             = 4
+	defaultCooldown401Sec          = 30
+	defaultCooldown429Sec          = 60
+	defaultRefreshSingleTimeoutSec = 30
 )
+
+/**
+ * ManagerOptions 账号管理器的可选配置（由 config 传入，零值使用默认）
+ */
+type ManagerOptions struct {
+	AuthScanInterval        int /* 热加载扫描间隔（秒） */
+	SaveWorkers             int /* 异步写入协程数 */
+	Cooldown401Sec          int /* 401 后冷却（秒） */
+	Cooldown429Sec          int /* 429 后冷却（秒） */
+	RefreshSingleTimeoutSec int /* 单次刷新请求超时（秒） */
+	RefreshBatchSize        int /* 刷新批大小，0=不分批；>0 每批完成后再启下一批以控内存 */
+}
 
 /**
  * Manager 账号管理器
@@ -34,17 +50,23 @@ const (
  * @field stopCh - 停止信号通道
  */
 type Manager struct {
-	mu                 sync.RWMutex
-	accounts           []*Account
-	accountIndex       map[string]*Account
-	accountsPtr        atomic.Pointer[[]*Account] /* 原子快照，Pick 热路径零锁读取 */
-	refresher          *Refresher
-	selector           Selector
-	authDir            string
-	refreshInterval    int
-	refreshConcurrency int
-	saveQueue          chan *Account /* 异步磁盘写入队列 */
-	stopCh             chan struct{}
+	mu                      sync.RWMutex
+	accounts                []*Account
+	accountIndex            map[string]*Account
+	accountsPtr             atomic.Pointer[[]*Account] /* 原子快照，Pick 热路径零锁读取 */
+	refresher               *Refresher
+	selector                Selector
+	authDir                 string
+	refreshInterval         int
+	refreshConcurrency      int
+	scanIntervalSec         int
+	saveWorkers             int
+	cooldown401Sec          int
+	cooldown429Sec          int
+	refreshSingleTimeoutSec int
+	refreshBatchSize        int
+	saveQueue               chan *Account /* 异步磁盘写入队列 */
+	stopCh                  chan struct{}
 }
 
 /**
@@ -53,22 +75,48 @@ type Manager struct {
  * @param proxyURL - 代理地址
  * @param refreshInterval - 刷新间隔（秒）
  * @param selector - 账号选择器
+ * @param opts - 可选配置，nil 时使用默认值
  * @returns *Manager - 账号管理器实例
  */
-func NewManager(authDir, proxyURL string, refreshInterval int, selector Selector, enableHTTP2 bool) *Manager {
+func NewManager(authDir, proxyURL string, refreshInterval int, selector Selector, enableHTTP2 bool, opts *ManagerOptions) *Manager {
 	if selector == nil {
 		selector = NewRoundRobinSelector()
 	}
 	m := &Manager{
-		accounts:           make([]*Account, 0, 1024),
-		accountIndex:       make(map[string]*Account, 1024),
-		refresher:          NewRefresher(proxyURL, enableHTTP2),
-		selector:           selector,
-		authDir:            authDir,
-		refreshInterval:    refreshInterval,
-		refreshConcurrency: defaultRefreshConcurrency,
-		saveQueue:          make(chan *Account, 4096),
-		stopCh:             make(chan struct{}),
+		accounts:                make([]*Account, 0, 1024),
+		accountIndex:            make(map[string]*Account, 1024),
+		refresher:               NewRefresher(proxyURL, enableHTTP2),
+		selector:                selector,
+		authDir:                 authDir,
+		refreshInterval:         refreshInterval,
+		refreshConcurrency:      defaultRefreshConcurrency,
+		scanIntervalSec:         defaultScanInterval,
+		saveWorkers:             defaultSaveWorkers,
+		cooldown401Sec:          defaultCooldown401Sec,
+		cooldown429Sec:          defaultCooldown429Sec,
+		refreshSingleTimeoutSec: defaultRefreshSingleTimeoutSec,
+		saveQueue:               make(chan *Account, 4096),
+		stopCh:                  make(chan struct{}),
+	}
+	if opts != nil {
+		if opts.AuthScanInterval > 0 {
+			m.scanIntervalSec = opts.AuthScanInterval
+		}
+		if opts.SaveWorkers > 0 {
+			m.saveWorkers = opts.SaveWorkers
+		}
+		if opts.Cooldown401Sec > 0 {
+			m.cooldown401Sec = opts.Cooldown401Sec
+		}
+		if opts.Cooldown429Sec > 0 {
+			m.cooldown429Sec = opts.Cooldown429Sec
+		}
+		if opts.RefreshSingleTimeoutSec > 0 {
+			m.refreshSingleTimeoutSec = opts.RefreshSingleTimeoutSec
+		}
+		if opts.RefreshBatchSize > 0 {
+			m.refreshBatchSize = opts.RefreshBatchSize
+		}
 	}
 	empty := make([]*Account, 0)
 	m.accountsPtr.Store(&empty)
@@ -333,7 +381,7 @@ func (m *Manager) StartRefreshLoop(ctx context.Context) {
 	defer refreshTicker.Stop()
 
 	/* 热加载扫描间隔（比刷新更频繁） */
-	scanInterval := time.Duration(defaultScanInterval) * time.Second
+	scanInterval := time.Duration(m.scanIntervalSec) * time.Second
 	if scanInterval > refreshInterval {
 		scanInterval = refreshInterval
 	}
@@ -386,8 +434,11 @@ func (m *Manager) publishSnapshot() {
  */
 func (m *Manager) StartSaveWorker(ctx context.Context) {
 	/* 启动多个写入 goroutine 并行消费队列，加速 2w+ 账号的磁盘写入 */
-	const saveWorkers = 4
-	for i := 0; i < saveWorkers; i++ {
+	n := m.saveWorkers
+	if n < 1 {
+		n = defaultSaveWorkers
+	}
+	for i := 0; i < n; i++ {
 		go func() {
 			for {
 				select {
@@ -516,25 +567,36 @@ func (m *Manager) refreshAllAccountsConcurrent(ctx context.Context) {
 		return
 	}
 
+	batchSize := m.refreshBatchSize
+	if batchSize <= 0 {
+		batchSize = len(needRefresh)
+	}
 	sem := make(chan struct{}, m.refreshConcurrency)
 	var wg sync.WaitGroup
 
-	for _, acc := range needRefresh {
+	for i := 0; i < len(needRefresh); i += batchSize {
 		if ctx.Err() != nil {
 			break
 		}
-
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(a *Account) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			m.refreshAccount(ctx, a)
-		}(acc)
+		end := i + batchSize
+		if end > len(needRefresh) {
+			end = len(needRefresh)
+		}
+		batch := needRefresh[i:end]
+		for _, acc := range batch {
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(a *Account) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				m.refreshAccount(ctx, a)
+			}(acc)
+		}
+		wg.Wait()
 	}
-
-	wg.Wait()
 	log.Infof("刷新完成: 刷新 %d 个账号，耗时 %v，剩余 %d 个",
 		len(needRefresh), time.Since(start).Round(time.Millisecond), m.AccountCount())
 }
@@ -736,8 +798,8 @@ func (m *Manager) forceRefreshAccount(ctx context.Context, acc *Account) bool {
 	if err != nil {
 		/* 429 限频：设冷却而不是删除 */
 		if IsRateLimitRefreshErr(err) {
-			acc.SetCooldown(60 * time.Second)
-			log.Warnf("账号 [%s] 刷新限频 429，冷却 60s", email)
+			acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+			log.Warnf("账号 [%s] 刷新限频 429，冷却 %ds", email, m.cooldown429Sec)
 			return false
 		}
 		log.Warnf("账号 [%s] 刷新失败，移除: %v", email, err)
@@ -763,7 +825,7 @@ func (m *Manager) HandleAuth401(acc *Account) {
 	email := acc.GetEmail()
 
 	/* 立即设为冷却状态，防止后续请求继续使用该账号 */
-	acc.SetCooldown(30 * time.Second)
+	acc.SetCooldown(time.Duration(m.cooldown401Sec) * time.Second)
 	log.Warnf("账号 [%s] 遇到 401，已临时冷却，后台刷新中...", email)
 
 	/* CAS 去重：防止同一账号被多个刷新源同时刷新 */
@@ -776,7 +838,11 @@ func (m *Manager) HandleAuth401(acc *Account) {
 	go func() {
 		defer acc.refreshing.Store(0)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		timeoutSec := m.refreshSingleTimeoutSec
+		if timeoutSec < 1 {
+			timeoutSec = defaultRefreshSingleTimeoutSec
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 		defer cancel()
 
 		acc.mu.RLock()
@@ -793,8 +859,8 @@ func (m *Manager) HandleAuth401(acc *Account) {
 		if err != nil {
 			/* 429 限频：设冷却而不是删除 */
 			if IsRateLimitRefreshErr(err) {
-				acc.SetCooldown(60 * time.Second)
-				log.Warnf("账号 [%s] 401 后台刷新限频 429，冷却 60s", email)
+				acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+				log.Warnf("账号 [%s] 401 后台刷新限频 429，冷却 %ds", email, m.cooldown429Sec)
 				return
 			}
 			log.Warnf("账号 [%s] 后台刷新失败，移除: %v", email, err)
@@ -841,8 +907,8 @@ func (m *Manager) refreshAccount(ctx context.Context, acc *Account) {
 	if err != nil {
 		/* 429 限频：设冷却而不是删除 */
 		if IsRateLimitRefreshErr(err) {
-			acc.SetCooldown(60 * time.Second)
-			log.Warnf("账号 [%s] 刷新限频 429，冷却 60s", email)
+			acc.SetCooldown(time.Duration(m.cooldown429Sec) * time.Second)
+			log.Warnf("账号 [%s] 刷新限频 429，冷却 %ds", email, m.cooldown429Sec)
 			return
 		}
 		log.Warnf("账号 [%s] 刷新失败，移除: %v", email, err)

@@ -45,10 +45,14 @@ func (h *ProxyHandler) handleMessages(c *gin.Context) {
 	if stream {
 		if execErr := h.executeClaudeStream(c, rc, openaiBody, model); execErr != nil {
 			handleClaudeExecutorError(c, execErr)
+		} else {
+			RecordRequest()
 		}
 	} else {
 		if execErr := h.executeClaudeNonStream(c, rc, openaiBody, model); execErr != nil {
 			handleClaudeExecutorError(c, execErr)
+		} else {
+			RecordRequest()
 		}
 	}
 }
@@ -85,7 +89,7 @@ func (h *ProxyHandler) executeClaudeStream(c *gin.Context, rc executor.RetryConf
 	state := translator.NewClaudeStreamState(model)
 
 	scanner := bufio.NewScanner(rawResp.Body)
-	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
+	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()

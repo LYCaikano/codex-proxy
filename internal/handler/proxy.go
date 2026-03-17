@@ -27,9 +27,16 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+/* 与 executor 一致的缓冲与扫描器大小，便于统一调优 */
+const (
+	wsBufferSize    = 32 * 1024
+	scannerInitSize = 4 * 1024
+	scannerMaxSize  = 50 * 1024 * 1024
+)
+
 var responsesWSUpgrader = websocket.Upgrader{
-	ReadBufferSize:  32 * 1024,
-	WriteBufferSize: 32 * 1024,
+	ReadBufferSize:  wsBufferSize,
+	WriteBufferSize: wsBufferSize,
 	CheckOrigin: func(_ *http.Request) bool {
 		return true
 	},
@@ -43,12 +50,16 @@ var responsesWSUpgrader = websocket.Upgrader{
  * @field maxRetry - 请求失败最大重试次数（切换账号重试）
  */
 type ProxyHandler struct {
-	manager      *auth.Manager
-	executor     *executor.Executor
-	apiKeys      []string
-	maxRetry     int
-	quotaChecker *auth.QuotaChecker
-	indexHTML    []byte
+	manager               *auth.Manager
+	executor              *executor.Executor
+	apiKeys               []string
+	maxRetry              int
+	quotaChecker          *auth.QuotaChecker
+	indexHTML             []byte
+	upstreamTimeoutSec    int
+	emptyRetryMax         int
+	streamIdleTimeoutSec  int
+	enableStreamIdleRetry bool
 }
 
 /**
@@ -57,19 +68,27 @@ type ProxyHandler struct {
  * @param exec - Codex 执行器
  * @param apiKeys - API Key 列表
  * @param maxRetry - 最大重试次数（0 表示不重试）
+ * @param quotaCheckConcurrency - 额度查询并发数（来自 config）
  * @returns *ProxyHandler - 代理处理器实例
  */
-func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, indexHTML []byte) *ProxyHandler {
+func NewProxyHandler(manager *auth.Manager, exec *executor.Executor, apiKeys []string, maxRetry int, proxyURL string, baseURL string, enableHTTP2 bool, backendDomain string, backendResolveAddress string, quotaCheckConcurrency int, upstreamTimeoutSec, emptyRetryMax, streamIdleTimeoutSec int, enableStreamIdleRetry bool, indexHTML []byte) *ProxyHandler {
 	if maxRetry < 0 {
 		maxRetry = 0
 	}
+	if quotaCheckConcurrency <= 0 {
+		quotaCheckConcurrency = 50
+	}
 	return &ProxyHandler{
-		manager:      manager,
-		executor:     exec,
-		apiKeys:      apiKeys,
-		maxRetry:     maxRetry,
-		quotaChecker: auth.NewQuotaChecker(baseURL, proxyURL, 50, enableHTTP2, backendDomain, backendResolveAddress),
-		indexHTML:    indexHTML,
+		manager:               manager,
+		executor:              exec,
+		apiKeys:               apiKeys,
+		maxRetry:              maxRetry,
+		quotaChecker:          auth.NewQuotaChecker(baseURL, proxyURL, quotaCheckConcurrency, enableHTTP2, backendDomain, backendResolveAddress),
+		indexHTML:             indexHTML,
+		upstreamTimeoutSec:    upstreamTimeoutSec,
+		emptyRetryMax:         emptyRetryMax,
+		streamIdleTimeoutSec:  streamIdleTimeoutSec,
+		enableStreamIdleRetry: enableStreamIdleRetry,
 	}
 }
 
@@ -242,10 +261,12 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 		PickFn: func(model string, excluded map[string]bool) (*auth.Account, error) {
 			return h.manager.PickExcluding(model, excluded)
 		},
-		On401Fn: func(acc *auth.Account) {
-			h.manager.HandleAuth401(acc)
-		},
-		MaxRetry: h.maxRetry,
+		On401Fn:               func(acc *auth.Account) { h.manager.HandleAuth401(acc) },
+		MaxRetry:              h.maxRetry,
+		UpstreamTimeoutSec:    h.upstreamTimeoutSec,
+		EmptyRetryMax:         h.emptyRetryMax,
+		StreamIdleTimeoutSec:  h.streamIdleTimeoutSec,
+		EnableStreamIdleRetry: h.enableStreamIdleRetry,
 	}
 }
 
@@ -298,6 +319,8 @@ func (h *ProxyHandler) handleChatCompletions(c *gin.Context) {
 	if stream {
 		if execErr := h.executor.ExecuteStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
 			handleExecutorError(c, execErr)
+		} else {
+			RecordRequest()
 		}
 	} else {
 		result, execErr := h.executor.ExecuteNonStream(c.Request.Context(), rc, body, model)
@@ -305,6 +328,7 @@ func (h *ProxyHandler) handleChatCompletions(c *gin.Context) {
 			handleExecutorError(c, execErr)
 			return
 		}
+		RecordRequest()
 		c.Data(http.StatusOK, "application/json", result)
 	}
 }
@@ -317,10 +341,13 @@ func (h *ProxyHandler) handleStats(c *gin.Context) {
 	accounts := h.manager.GetAccounts()
 	stats := make([]auth.AccountStats, 0, len(accounts))
 	active, cooldown, disabled := 0, 0, 0
+	var totalInputTokens, totalOutputTokens int64
 
 	for _, acc := range accounts {
 		s := acc.GetStats()
 		stats = append(stats, s)
+		totalInputTokens += s.Usage.InputTokens
+		totalOutputTokens += s.Usage.OutputTokens
 		switch s.Status {
 		case "active":
 			active++
@@ -333,10 +360,13 @@ func (h *ProxyHandler) handleStats(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"summary": gin.H{
-			"total":    len(accounts),
-			"active":   active,
-			"cooldown": cooldown,
-			"disabled": disabled,
+			"total":               len(accounts),
+			"active":              active,
+			"cooldown":            cooldown,
+			"disabled":            disabled,
+			"rpm":                 GetRPM(),
+			"total_input_tokens":  totalInputTokens,
+			"total_output_tokens": totalOutputTokens,
 		},
 		"accounts": stats,
 	})
@@ -418,6 +448,8 @@ func (h *ProxyHandler) handleResponses(c *gin.Context) {
 	if stream {
 		if execErr := h.executor.ExecuteResponsesStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
 			handleExecutorError(c, execErr)
+		} else {
+			RecordRequest()
 		}
 	} else {
 		result, execErr := h.executor.ExecuteResponsesNonStream(c.Request.Context(), rc, body, model)
@@ -425,6 +457,7 @@ func (h *ProxyHandler) handleResponses(c *gin.Context) {
 			handleExecutorError(c, execErr)
 			return
 		}
+		RecordRequest()
 		c.Data(http.StatusOK, "application/json", result)
 	}
 }
@@ -478,6 +511,9 @@ func (h *ProxyHandler) handleResponsesWS(c *gin.Context) {
 			rc := h.buildRetryConfig()
 			streamErr := h.forwardResponsesSSEAsWS(c.Request.Context(), conn, rc, requestBody, model)
 			inProgress = false
+			if streamErr == nil {
+				RecordRequest()
+			}
 			if streamErr != nil {
 				if errors.Is(streamErr, executor.ErrEmptyResponse) {
 					h.writeWSError(conn, "invalid_response", "empty response")
@@ -515,7 +551,7 @@ func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websoc
 	hasTool := false
 
 	scanner := bufio.NewScanner(rawResp.Body)
-	scanner.Buffer(make([]byte, 4*1024), 50*1024*1024)
+	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -589,6 +625,8 @@ func (h *ProxyHandler) handleResponsesCompact(c *gin.Context) {
 	if stream {
 		if execErr := h.executor.ExecuteResponsesCompactStream(c.Request.Context(), rc, body, model, c.Writer); execErr != nil {
 			handleExecutorError(c, execErr)
+		} else {
+			RecordRequest()
 		}
 	} else {
 		result, execErr := h.executor.ExecuteResponsesCompactNonStream(c.Request.Context(), rc, body, model)
@@ -596,6 +634,7 @@ func (h *ProxyHandler) handleResponsesCompact(c *gin.Context) {
 			handleExecutorError(c, execErr)
 			return
 		}
+		RecordRequest()
 		c.Data(http.StatusOK, "application/json", result)
 	}
 }

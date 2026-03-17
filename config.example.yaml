@@ -53,6 +53,49 @@ refresh-concurrency: 50
 # 启动即服务可用：先启动 HTTP，再后台加载账号（推荐开启）
 startup-async-load: true
 
+# 后台加载模式下，加载失败后重试间隔（秒）
+# startup-load-retry-interval: 10
+
+# 优雅关闭时等待 HTTP 请求完成的超时（秒，1-60）
+# shutdown-timeout: 5
+
+# 热加载扫描 auth 目录间隔（秒）
+# auth-scan-interval: 30
+
+# 异步磁盘写入 Token 的工作协程数（1-32，账号多时可适当增大）
+# save-workers: 4
+
+# 401 后账号冷却时间（秒）
+# cooldown-401-sec: 30
+
+# 429 限频后账号冷却时间（秒）
+# cooldown-429-sec: 60
+
+# 单次 Token 刷新请求超时（秒）
+# refresh-single-timeout-sec: 30
+
+# 额度查询并发数（0 表示使用 refresh-concurrency）
+# quota-check-concurrency: 0
+
+# 连接池保活 ping 间隔（秒）
+# keepalive-interval: 60
+
+# 上游响应超时（秒），0 不限制；超时则换号重试
+# upstream-timeout-sec: 0
+
+# 流式两包间最大间隔（秒），0 禁用；无首包或包间隔过长时换号重试（可关闭）
+# stream-idle-timeout-sec: 0
+# enable-stream-idle-retry: true
+
+# 空返回时最多再重试次数
+# empty-retry-max: 2
+
+# 选号策略: round-robin | quota-first（每次选额度最高）
+# selector: "round-robin"
+
+# 刷新批大小（0=不分批）；>0 时每批完成后再启下一批，降低大账号数时的内存
+# refresh-batch-size: 0
+
 # 连接池配置（0 表示不限制）
 max-conns-per-host: 512
 max-idle-conns: 1024

@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -84,7 +84,7 @@
     }
     .grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
       gap: 16px;
       margin-bottom: 24px;
     }
@@ -293,7 +293,8 @@
     @media (max-width: 640px) {
       .grid { grid-template-columns: 1fr; }
       th:nth-child(2), td:nth-child(2),
-      th:nth-child(7), td:nth-child(7) { display: none; }
+      th:nth-child(7), td:nth-child(7),
+      th:nth-child(8), td:nth-child(8) { display: none; }
     }
   </style>
 </head>
@@ -363,6 +364,8 @@
             <th>套餐</th>
             <th>请求数</th>
             <th>错误</th>
+            <th>输入 Token</th>
+            <th>输出 Token</th>
             <th>最后使用</th>
             <th>Token 过期</th>
             <th>额度</th>
@@ -525,10 +528,13 @@
       const safe = summary || {};
       const total = safe.total ?? accounts.length;
       const cards = [
-        { label: "总账号", value: total, color: "#ff6b35" },
-        { label: "活跃", value: safe.active ?? 0, color: "#16a34a" },
-        { label: "冷却中", value: safe.cooldown ?? 0, color: "#db2777" },
-        { label: "禁用", value: safe.disabled ?? 0, color: "#475569" }
+        { label: "总账号", value: total },
+        { label: "活跃", value: safe.active ?? 0 },
+        { label: "冷却中", value: safe.cooldown ?? 0 },
+        { label: "禁用", value: safe.disabled ?? 0 },
+        { label: "RPM", value: safe.rpm ?? 0 },
+        { label: "总输入 Token", value: safe.total_input_tokens ?? 0 },
+        { label: "总输出 Token", value: safe.total_output_tokens ?? 0 }
       ];
       els.summaryCards.innerHTML = cards.map(card => `
         <div class="card">
@@ -549,12 +555,15 @@
       const fragment = document.createDocumentFragment();
       for (const row of pageRows) {
         const tr = document.createElement("tr");
+        const usage = row.usage || {};
         tr.innerHTML = `
           <td>${row.email || "--"}</td>
           <td><span class="status ${row.status || "disabled"}">${row.status || "--"}</span></td>
           <td>${row.plan_type || "--"}</td>
           <td>${formatNumber(row.total_requests)}</td>
           <td>${formatNumber(row.total_errors)}</td>
+          <td>${formatNumber(usage.input_tokens)}</td>
+          <td>${formatNumber(usage.output_tokens)}</td>
           <td>${formatDate(row.last_used_at)}</td>
           <td>${formatDate(row.token_expire)}</td>
           <td>${row.quota_exhausted ? "已用尽" : "可用"}</td>
