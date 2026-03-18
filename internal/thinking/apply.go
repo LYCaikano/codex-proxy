@@ -32,8 +32,8 @@ var levelToBudgetMap = map[string]int{
  *
  * 支持的后缀格式：
  *   - gpt-5.4-high → reasoning.effort = "high"
- *   - gpt-5.4-fast → service_tier = "fast"
- *   - gpt-5.4-high-fast → reasoning.effort = "high" + service_tier = "fast"
+ *   - gpt-5.4-fast → service_tier = "priority"（OpenAI Priority 层级）
+ *   - gpt-5.4-high-fast → reasoning.effort = "high" + service_tier = "priority"
  *
  * @param body - 原始请求体 JSON
  * @param model - 模型名（可能包含思考后缀和/或 -fast 后缀）
@@ -57,9 +57,9 @@ func ApplyThinking(body []byte, model string) ([]byte, string) {
 		body = applyCodexThinking(body, config)
 	}
 
-	/* 应用 fast 模式：设置 service_tier */
+	/* 仅模型名带 -fast 后缀时写入 Priority 服务层级 */
 	if parsed.IsFast {
-		body, _ = sjson.SetBytes(body, "service_tier", parsed.ServiceTier)
+		body, _ = sjson.SetBytes(body, "service_tier", "priority")
 	}
 
 	return body, baseModel

@@ -116,12 +116,7 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		result, _ = sjson.DeleteBytes(result, "user")
 		result, _ = sjson.DeleteBytes(result, "variant")
 
-		/* service_tier 仅保留 "priority" 值，其他删除 */
-		if v := gjson.GetBytes(result, "service_tier"); v.Exists() {
-			if v.String() != "priority" {
-				result, _ = sjson.DeleteBytes(result, "service_tier")
-			}
-		}
+		/* service_tier：-fast 时 ApplyThinking 写入 priority，其余透传客户端原值 */
 
 		/* 修复 tools 中 array 类型缺少 items 的 schema 问题 */
 		result = fixToolsArraySchema(result)
@@ -375,7 +370,12 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		}
 	}
 
-	/* service_tier 不被 Codex API 支持，不再透传 */
+	/* -fast 时为 priority；其余透传客户端自带的 service_tier（若有） */
+	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() {
+		if st := strings.TrimSpace(v.String()); st != "" {
+			out, _ = sjson.Set(out, "service_tier", st)
+		}
+	}
 
 	out, _ = sjson.Set(out, "store", false)
 	return []byte(out)

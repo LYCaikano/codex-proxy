@@ -3,7 +3,7 @@
  * 从模型名尾部向前逐个识别已知后缀并剥离，剩余部分即为真实模型名
  *
  * 解析顺序（从右到左）：
- *   1. -fast → 服务层级 service_tier="fast"
+ *   1. -fast → 服务层级 service_tier="priority"（Priority 处理队列）
  *   2. -high/-low/-medium 等 → 思考等级 reasoning.effort
  *   3. -12345 → 数字 token 预算
  *   4. 剩余部分 → 真实模型名（直接转发给上游）
@@ -11,9 +11,9 @@
  * 示例：
  *   - "gpt-5.4" → model="gpt-5.4"
  *   - "gpt-5.4-high" → model="gpt-5.4", thinking=high
- *   - "gpt-5.4-fast" → model="gpt-5.4", service_tier=fast
- *   - "gpt-5.4-high-fast" → model="gpt-5.4", thinking=high, service_tier=fast
- *   - "any-new-model-xhigh-fast" → model="any-new-model", thinking=xhigh, service_tier=fast
+ *   - "gpt-5.4-fast" → model="gpt-5.4", service_tier=priority
+ *   - "gpt-5.4-high-fast" → model="gpt-5.4", thinking=high, service_tier=priority
+ *   - "any-new-model-xhigh-fast" → model="any-new-model", thinking=xhigh, service_tier=priority
  *   - "o4-mini-low" → model="o4-mini", thinking=low
  */
 package thinking
@@ -69,7 +69,7 @@ func ParseModelSuffix(model string) ParseResult {
 	lower := strings.ToLower(model)
 	if strings.HasSuffix(lower, "-fast") && len(model) > 5 {
 		result.IsFast = true
-		result.ServiceTier = "fast"
+		result.ServiceTier = "priority" /* 与 ApplyThinking 写入上游的 service_tier 一致 */
 		model = model[:len(model)-5]
 	}
 

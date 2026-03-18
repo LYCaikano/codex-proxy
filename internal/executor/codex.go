@@ -390,7 +390,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
 		return err
 	}
-	if !state.HasText && !state.HasToolCall {
+	if !state.HasText && !state.HasToolCall && !state.HasReasoning {
 		firstChunkDur := time.Duration(0)
 		completedDur := time.Duration(0)
 		tailAfterCompleted := time.Duration(0)

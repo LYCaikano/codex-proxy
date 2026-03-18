@@ -74,7 +74,7 @@ type ThinkingConfig struct {
  * @field HasSuffix - 是否检测到有效的思考后缀
  * @field RawSuffix - 原始思考后缀值
  * @field IsFast - 是否启用 fast 模式（模型名以 -fast 结尾）
- * @field ServiceTier - 服务层级（fast 时为 "fast"，否则为空）
+ * @field ServiceTier - 服务层级（-fast 后缀时为 "priority"，否则为空）
  */
 type ParseResult struct {
 	ModelName   string

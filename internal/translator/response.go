@@ -8,6 +8,7 @@ package translator
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -30,21 +31,26 @@ var dataPrefix = []byte("data:")
  * @field UsageInput - response.completed 时提取的 input_tokens
  * @field UsageOutput - response.completed 时提取的 output_tokens
  * @field UsageTotal - response.completed 时提取的 total_tokens
+ * @field HasReasoning - 是否已向客户端输出过思维链（reasoning_content）
+ * @field reasoningDeltaByItem - 按 item_id 累积 reasoning_text.delta，用于与 reasoning_text.done 对齐补尾
  */
 type StreamState struct {
-	ResponseID           string
-	CreatedAt            int64
-	Model                string
-	FunctionCallIndex    int
-	HasText              bool
-	HasToolCall          bool
-	Completed            bool
-	HasReceivedArgsDelta bool
-	HasToolCallAnnounced bool
-	baseTpl              string
-	UsageInput           int64
-	UsageOutput          int64
-	UsageTotal           int64
+	ResponseID               string
+	CreatedAt                int64
+	Model                    string
+	FunctionCallIndex        int
+	HasText                  bool
+	HasToolCall              bool
+	HasReasoning             bool
+	Completed                bool
+	HasReceivedArgsDelta     bool
+	HasToolCallAnnounced     bool
+	baseTpl                  string
+	UsageInput               int64
+	UsageOutput              int64
+	UsageTotal               int64
+	reasoningDeltaByItem     map[string]string
+	hasReasoningSummaryDelta bool
 }
 
 /**
@@ -93,6 +99,9 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		if m := root.Get("response.model").String(); m != "" {
 			state.Model = m
 		}
+		state.reasoningDeltaByItem = nil
+		state.HasReasoning = false
+		state.hasReasoningSummaryDelta = false
 		tpl := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null}]}`
 		tpl, _ = sjson.Set(tpl, "id", state.ResponseID)
 		tpl, _ = sjson.Set(tpl, "created", state.CreatedAt)
@@ -117,18 +126,87 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 	switch dataType {
 	case "response.reasoning_summary_text.delta":
 		if delta := root.Get("delta"); delta.Exists() {
+			ds := delta.String()
+			if ds == "" {
+				return nil
+			}
+			state.hasReasoningSummaryDelta = true
+			state.HasReasoning = true
 			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
-			tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", delta.String())
+			tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", ds)
 		}
 
 	case "response.reasoning_summary_text.done":
-		tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
-		tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", "\n\n")
+		/* 仅有 .done、无 delta 时用 text 补全摘要，避免重复输出 */
+		if txt := root.Get("text").String(); txt != "" && !state.hasReasoningSummaryDelta {
+			state.HasReasoning = true
+			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+			tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", txt)
+		} else {
+			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+			tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", "\n\n")
+		}
 
 	case "response.reasoning.delta", "response.reasoning_text.delta":
-		if delta := root.Get("delta"); delta.Exists() && delta.String() != "" {
-			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
-			tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", delta.String())
+		itemID := root.Get("item_id").String()
+		if itemID == "" {
+			itemID = fmt.Sprintf("_idx:%d", root.Get("output_index").Int())
+		}
+		delta := root.Get("delta")
+		if !delta.Exists() {
+			return nil
+		}
+		ds := delta.String()
+		if state.reasoningDeltaByItem == nil {
+			state.reasoningDeltaByItem = make(map[string]string)
+		}
+		state.reasoningDeltaByItem[itemID] += ds
+		if ds == "" {
+			return nil
+		}
+		state.HasReasoning = true
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", ds)
+
+	case "response.reasoning_text.done":
+		full := root.Get("text").String()
+		itemID := root.Get("item_id").String()
+		if itemID == "" {
+			itemID = fmt.Sprintf("_idx:%d", root.Get("output_index").Int())
+		}
+		acc := ""
+		if state.reasoningDeltaByItem != nil {
+			acc = state.reasoningDeltaByItem[itemID]
+			delete(state.reasoningDeltaByItem, itemID)
+		}
+		if full == "" {
+			return nil
+		}
+		/* 无 delta 时 .done 的 text 为全文；有 delta 时补发尾部（避免上游只发 done） */
+		var toEmit string
+		if acc == "" {
+			toEmit = full
+		} else if strings.HasPrefix(full, acc) && len(full) > len(acc) {
+			toEmit = full[len(acc):]
+		} else if full != acc {
+			toEmit = full
+		}
+		if toEmit == "" {
+			return nil
+		}
+		state.HasReasoning = true
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", toEmit)
+
+	case "response.content_part.added":
+		/* 部分上游用 content_part 承载 reasoning_text（与 reasoning_text.delta 二选一或并存） */
+		part := root.Get("part")
+		if part.Get("type").String() == "reasoning_text" {
+			if t := part.Get("text").String(); t != "" {
+				state.HasReasoning = true
+				tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+				tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", t)
+			}
 		}
 
 	case "response.output_text.delta":
@@ -241,6 +319,7 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 	default:
 		if strings.Contains(dataType, "reasoning") && strings.HasSuffix(dataType, ".delta") {
 			if delta := root.Get("delta"); delta.Exists() && delta.String() != "" {
+				state.HasReasoning = true
 				tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
 				tpl, _ = sjson.Set(tpl, "choices.0.delta.reasoning_content", delta.String())
 				return []string{tpl}
@@ -316,6 +395,16 @@ func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap 
 					for _, si := range summary.Array() {
 						if si.Get("type").String() == "summary_text" {
 							if t := si.Get("text").String(); t != "" {
+								reasoningBuilder.WriteString(t)
+							}
+						}
+					}
+				}
+				/* Responses API：正文思维链在 content[] 的 reasoning_text 中（与 CLIProxy / 官方文档一致） */
+				if content := item.Get("content"); content.IsArray() {
+					for _, ci := range content.Array() {
+						if ci.Get("type").String() == "reasoning_text" {
+							if t := ci.Get("text").String(); t != "" {
 								reasoningBuilder.WriteString(t)
 							}
 						}
