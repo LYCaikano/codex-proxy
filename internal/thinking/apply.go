@@ -30,6 +30,9 @@ var levelToBudgetMap = map[string]int{
  * ApplyThinking 将思考配置和服务层级应用到请求体
  * 解析模型名中的思考后缀和 -fast 后缀，写入请求 JSON
  *
+ * 无后缀模型（如 gpt-5、gpt-5-codex）且客户端未传思考相关参数时，不设置 reasoning.effort，
+ * 即默认按「不传递」处理，由上游按自身策略（如 auto）生效。
+ *
  * @param body - 原始请求体 JSON
  * @param model - 模型名（可能包含思考后缀和/或 -fast 后缀）
  * @returns []byte - 处理后的请求体 JSON
@@ -43,11 +46,10 @@ func ApplyThinking(body []byte, model string) ([]byte, string) {
 	if parsed.HasSuffix {
 		config = ParseSuffixToConfig(parsed.RawSuffix)
 	} else {
-		/* 没有后缀时，尝试从请求体中提取 */
 		config = extractConfigFromBody(body)
 	}
 
-	/* 应用思考配置到请求体 */
+	/* 仅当有思考配置时才写入请求体 */
 	if hasThinkingConfig(config) {
 		body = applyCodexThinking(body, config)
 	}
@@ -163,7 +165,7 @@ func budgetToLevel(budget int) string {
 	case budget <= 0:
 		return "none"
 	case budget <= 512:
-		return "minimal"
+		return "auto"
 	case budget <= 1024:
 		return "low"
 	case budget <= 8192:

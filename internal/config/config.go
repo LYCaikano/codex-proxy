@@ -101,9 +101,9 @@ func LoadConfig(path string) (*Config, error) {
 		HealthCheckBatchSize:       20,
 		HealthCheckReqTimeout:      8,
 		RefreshConcurrency:         50,
-		MaxConnsPerHost:            512,
-		MaxIdleConns:               1024,
-		MaxIdleConnsPerHost:        512,
+		MaxConnsPerHost:            20,  /* HTTP/2 下过高易触发上游 GOAWAY ENHANCE_YOUR_CALM */
+		MaxIdleConns:               50,
+		MaxIdleConnsPerHost:        10,
 		EnableHTTP2:                true,
 		StartupAsyncLoad:           true,
 		StartupLoadRetryInterval:   10,

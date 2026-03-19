@@ -112,25 +112,27 @@ curl http://localhost:8080/v1/messages \
 
 ## 思考配置
 
-在模型名中使用连字符后缀控制思考级别，可选 `-fast` 后缀启用快速模式。
+在模型名中使用连字符后缀控制思考级别；可选 `-fast` 后缀启用快速模式（如 `gpt-5.4-codex-high-fast`）。  
+**无后缀模型**（如 `gpt-5`、`gpt-5-codex`）且**客户端未传**思考相关参数（如 `reasoning.effort` / `reasoning_effort`）时，默认**不向请求体写入** `reasoning.effort`，由上游按不传递或 auto 处理。
 
-| 格式 | 说明 |
-|------|------|
-| `gpt-5.4-high` | 高思考级别 |
-| `gpt-5.4-fast` | fast 服务层级 |
-| `gpt-5.4-high-fast` | 高思考 + fast 层级 |
-| `gpt-5.4` | 使用请求体中的配置或默认值 |
+下表列出各基础模型可用的思考等级与变体，**每个基础模型均可加 `-fast`**（如 `gpt-5-codex-fast`、`gpt-5.1-codex-low-fast`）。
 
-不同基础模型支持的思考后缀不同
+| 基础模型 | 支持的思考等级 | 示例 model id |
+|----------|----------------|----------------|
+| `gpt-5` | low, medium, high, auto | `gpt-5`、`gpt-5-low`、`gpt-5-high-fast` |
+| `gpt-5-codex` | low, medium, high, auto | `gpt-5-codex`、`gpt-5-codex-low-fast`、`gpt-5-codex-auto` |
+| `gpt-5-codex-mini` | low, medium, high, auto | `gpt-5-codex-mini`、`gpt-5-codex-mini-medium-fast` |
+| `gpt-5.1` | low, medium, high, none, auto | `gpt-5.1`、`gpt-5.1-none-fast`、`gpt-5.1-high` |
+| `gpt-5.1-codex` | low, medium, high, max, auto | `gpt-5.1-codex`、`gpt-5.1-codex-max`、`gpt-5.1-codex-max-fast` |
+| `gpt-5.1-codex-mini` | low, medium, high, auto | `gpt-5.1-codex-mini-low`、`gpt-5.1-codex-mini-auto-fast` |
+| `gpt-5.1-codex-max` | low, medium, high, xhigh, auto | `gpt-5.1-codex-max-low`、`gpt-5.1-codex-max-xhigh-fast` |
+| `gpt-5.2` | low, medium, high, xhigh, none, auto | `gpt-5.2`、`gpt-5.2-xhigh-fast`、`gpt-5.2-none` |
+| `gpt-5.2-codex` | low, medium, high, xhigh, auto | `gpt-5.2-codex`、`gpt-5.2-codex-xhigh-fast` |
+| `gpt-5.3-codex` | low, medium, high, xhigh, none, auto | `gpt-5.3-codex`、`gpt-5.3-codex-none-fast` |
+| `gpt-5.4` | low, medium, high, xhigh, none, auto | `gpt-5.4`、`gpt-5.4-xhigh-fast`、`gpt-5.4-auto` |
+| `gpt-5.4-mini` | low, medium, high, xhigh, none, auto | `gpt-5.4-mini`、`gpt-5.4-mini-none-fast` |
 
-| 基础模型 | 支持的思考后缀 |
-|----------|---------------|
-| `gpt-5` / `gpt-5-codex` / `gpt-5-mini` | low, medium, high, auto |
-| `gpt-5.1` / `gpt-5.1-codex` / `gpt-5.1-mini` | low, medium, high, none, auto（codex 另有 max） |
-| `gpt-5.2` / `gpt-5.2-codex` / `gpt-5.2-mini` | low, medium, high, xhigh, none, auto |
-| `gpt-5.4` / `gpt-5.4-codex` / `gpt-5.4-mini` | low, medium, high, xhigh, none, auto |
-
-所有组合均支持 `-fast` 后缀（如 `gpt-5.4-codex-high-fast`）。
+以上每个 model id 均可再加 `-fast` 得到快速队列变体（如 `gpt-5.4-mini-high-fast`）。
 
 ## API 接口
 
@@ -161,7 +163,12 @@ curl http://localhost:8080/v1/messages \
 | `health-check-max-failures` | `3` | 连续失败多少次后禁用账号 |
 | `health-check-concurrency` | `5` | 健康检查并发数 |
 | `refresh-concurrency` | `50` | Token 并发刷新数 |
+| `max-conns-per-host` | `20` | 每主机最大连接数（HTTP/2 时内部上限 30，过高易触发上游 GOAWAY ENHANCE_YOUR_CALM） |
+| `max-idle-conns-per-host` | `10` | 每主机最大空闲连接数 |
+| `enable-http2` | `true` | 是否启用 HTTP/2 连接上游 |
 | `api-keys` | 空 | API Key 列表（为空则不鉴权） |
+
+若出现 `http2: server sent GOAWAY ... ENHANCE_YOUR_CALM`，可调低 `max-conns-per-host` 或关闭 `enable-http2`。
 
 ## 项目结构
 

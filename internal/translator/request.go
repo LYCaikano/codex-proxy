@@ -124,6 +124,9 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		/* system role → developer 转换（Codex 不接受 system role） */
 		result = convertSystemRoleToDeveloper(result)
 
+		/* 使用 json_object/json_schema 时上游要求 input 含 "json" */
+		result = ensureInputContainsJSON(result)
+
 		return result
 	}
 
@@ -249,6 +252,8 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		switch rft {
 		case "text":
 			out, _ = sjson.Set(out, "text.format.type", "text")
+		case "json_object":
+			out, _ = sjson.Set(out, "text.format.type", "json_object")
 		case "json_schema":
 			js := rf.Get("json_schema")
 			if js.Exists() {
@@ -274,12 +279,6 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 		for i := 0; i < len(arr); i++ {
 			t := arr[i]
 			toolType := t.Get("type").String()
-
-			/*
-			 * #1671: 处理 custom 类型工具（如 Codex CLI 的 apply_patch）
-			 * Codex CLI 发送 "type": "custom" 的工具定义，包含 Lark 语法格式
-			 * 需要将其转换为 Codex Responses API 兼容的格式
-			 */
 			if toolType == "custom" {
 				item := `{}`
 				item, _ = sjson.Set(item, "type", "function")
@@ -378,7 +377,8 @@ func ConvertOpenAIRequestToCodex(modelName string, rawJSON []byte, stream bool) 
 	}
 
 	out, _ = sjson.Set(out, "store", false)
-	return []byte(out)
+	outBytes := ensureInputContainsJSON([]byte(out))
+	return outBytes
 }
 
 /**
@@ -494,6 +494,43 @@ func buildShortNameMap(names []string) map[string]string {
 		m[n] = uniq
 	}
 	return m
+}
+
+/**
+ * ensureInputContainsJSON 当 text.format.type 为 json_object 或 json_schema 时，
+ * 若 instructions 与 input 消息中均未出现 "json"（不区分大小写），则向 instructions 前追加提示，
+ * 满足上游「input 须包含 json」的校验，避免 400。
+ */
+func ensureInputContainsJSON(body []byte) []byte {
+	ft := strings.ToLower(gjson.GetBytes(body, "text.format.type").String())
+	if ft != "json_object" && ft != "json_schema" {
+		return body
+	}
+	needle := "json"
+	hasJSON := func(s string) bool { return strings.Contains(strings.ToLower(s), needle) }
+	if hasJSON(gjson.GetBytes(body, "instructions").String()) {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if input.IsArray() {
+		for _, it := range input.Array() {
+			if it.Get("type").String() != "message" {
+				continue
+			}
+			for _, c := range it.Get("content").Array() {
+				if t := c.Get("text").String(); hasJSON(t) {
+					return body
+				}
+			}
+		}
+	}
+	inst := gjson.GetBytes(body, "instructions").String()
+	newInst := "Respond in JSON format."
+	if inst != "" {
+		newInst = newInst + "\n\n" + inst
+	}
+	out, _ := sjson.SetBytes(body, "instructions", newInst)
+	return out
 }
 
 /**

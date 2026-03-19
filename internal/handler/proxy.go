@@ -196,45 +196,38 @@ func (h *ProxyHandler) handleHealth(c *gin.Context) {
 		"accounts": h.manager.AccountCount(),
 	})
 }
+type modelListEntry struct {
+	base     string
+	suffixes []string
+}
 
-/**
- * gptModelVersions 列表中的 gpt 主版本段（与上游 id 一致，如 gpt-5.4）
- */
-var gptModelVersions = []string{"gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4"}
-var gptModelVariants = []string{"codex", "mini"}
-
-/**
- * thinkingSuffixes 所有可用的思考等级后缀
- */
-var thinkingSuffixes = []string{
-	"minimal", "low", "medium", "high", "xhigh", "max", "none", "auto",
+var modelList = []modelListEntry{
+	{base: "gpt-5", suffixes: []string{"low", "medium", "high", "auto"}},
+	{base: "gpt-5-codex", suffixes: []string{"low", "medium", "high", "auto"}},
+	{base: "gpt-5-codex-mini", suffixes: []string{"low", "medium", "high", "auto"}},
+	{base: "gpt-5.1", suffixes: []string{"low", "medium", "high", "none", "auto"}},
+	{base: "gpt-5.1-codex", suffixes: []string{"low", "medium", "high", "max", "auto"}},
+	{base: "gpt-5.1-codex-mini", suffixes: []string{"low", "medium", "high", "auto"}},
+	{base: "gpt-5.1-codex-max", suffixes: []string{"low", "medium", "high", "xhigh", "auto"}},
+	{base: "gpt-5.2", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
+	{base: "gpt-5.2-codex", suffixes: []string{"low", "medium", "high", "xhigh", "auto"}},
+	{base: "gpt-5.3-codex", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
+	{base: "gpt-5.4", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
+	{base: "gpt-5.4-mini", suffixes: []string{"low", "medium", "high", "xhigh", "none", "auto"}},
 }
 
 /**
  * handleModels 模型列表接口
- * 格式：gpt-{版本}-codex|mini[-{思考等级}][-fast]（codex/mini 为分支，转发上游不省略）
+ * 按 README 表格生成：每个基础模型 + 其支持的思考等级 + 均可加 -fast
  */
 func (h *ProxyHandler) handleModels(c *gin.Context) {
-	perCombo := 2 + len(thinkingSuffixes)*2
-	models := make([]gin.H, 0, len(gptModelVersions)*len(gptModelVariants)*perCombo)
-
-	for _, ver := range gptModelVersions {
-		for _, variant := range gptModelVariants {
-			base := ver + "-" + variant
-			models = append(models, gin.H{"id": base, "object": "model", "owned_by": "openai"})
-			models = append(models, gin.H{"id": base + "-fast", "object": "model", "owned_by": "openai"})
-			for _, suffix := range thinkingSuffixes {
-				models = append(models, gin.H{
-					"id":       base + "-" + suffix,
-					"object":   "model",
-					"owned_by": "openai",
-				})
-				models = append(models, gin.H{
-					"id":       base + "-" + suffix + "-fast",
-					"object":   "model",
-					"owned_by": "openai",
-				})
-			}
+	models := make([]gin.H, 0, 50*20) // 约 12 基础 × (2+8*2) 量级
+	for _, e := range modelList {
+		models = append(models, gin.H{"id": e.base, "object": "model", "owned_by": "openai"})
+		models = append(models, gin.H{"id": e.base + "-fast", "object": "model", "owned_by": "openai"})
+		for _, s := range e.suffixes {
+			models = append(models, gin.H{"id": e.base + "-" + s, "object": "model", "owned_by": "openai"})
+			models = append(models, gin.H{"id": e.base + "-" + s + "-fast", "object": "model", "owned_by": "openai"})
 		}
 	}
 

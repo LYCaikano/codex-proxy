@@ -51,6 +51,8 @@ const (
 	scannerInitSize             = 4 * 1024
 	scannerMaxSize              = 50 * 1024 * 1024
 	defaultKeepaliveIntervalSec = 60
+	/* HTTP/2 下每主机连接数上限，避免上游发送 GOAWAY ENHANCE_YOUR_CALM */
+	maxConnsPerHostHTTP2Cap = 30
 )
 
 type HTTPPoolConfig struct {
@@ -101,6 +103,9 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 		maxConnsPerHost = 0
 	}
 	enableHTTP2 := poolCfg.EnableHTTP2
+	if enableHTTP2 && maxConnsPerHost > maxConnsPerHostHTTP2Cap {
+		maxConnsPerHost = maxConnsPerHostHTTP2Cap
+	}
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 60 * time.Second,
@@ -164,6 +169,23 @@ type RetryConfig struct {
 	EmptyRetryMax         int
 	StreamIdleTimeoutSec  int
 	EnableStreamIdleRetry bool
+}
+
+/* 上游 HTTP/2 GOAWAY ENHANCE_YOUR_CALM 时的错误特征，用于日志与提示 */
+const enhanceYourCalmHint = "（上游限流：可调低 max-conns-per-host / max-idle-conns-per-host 或关闭 enable-http2）"
+
+/**
+ * wrapReadErr 若为 HTTP/2 GOAWAY ENHANCE_YOUR_CALM，附加说明便于排查
+ */
+func wrapReadErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	s := err.Error()
+	if strings.Contains(s, "GOAWAY") && strings.Contains(s, "ENHANCE_YOUR_CALM") {
+		return fmt.Errorf("%w %s", err, enhanceYourCalmHint)
+	}
+	return err
 }
 
 /**
@@ -388,7 +410,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 			tailAfterCompleted = time.Since(completedAt)
 		}
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
-		return err
+		return wrapReadErr(err)
 	}
 	if !state.HasText && !state.HasToolCall && !state.HasReasoning {
 		firstChunkDur := time.Duration(0)
@@ -639,7 +661,7 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 
 	if err = scanner.Err(); err != nil {
 		log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-		return nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(err))
 	}
 
 	log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (no completed)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
@@ -752,7 +774,7 @@ func (e *Executor) ExecuteResponsesCompactNonStream(ctx context.Context, rc Retr
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		log.Infof("req summary responses-compact-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-		return nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(err))
 	}
 
 	account.RecordSuccess()
