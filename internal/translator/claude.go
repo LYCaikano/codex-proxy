@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -279,6 +280,8 @@ type ClaudeStreamState struct {
 	HasStartedContent bool
 	HasText           bool
 	HasToolUse        bool
+	HasThinking       bool
+	InThinkingBlock   bool
 	Completed         bool
 }
 
@@ -341,12 +344,56 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 		msgStart, _ = sjson.SetRaw(msgStart, "message", msg)
 		events = append(events, formatClaudeSSE("message_start", msgStart))
 
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta":
+		delta := root.Get("delta").String()
+		if delta == "" {
+			return nil
+		}
+		state.HasThinking = true
+		if !state.InThinkingBlock {
+			state.ContentBlockIndex++
+			state.InThinkingBlock = true
+			blockStart := `{}`
+			blockStart, _ = sjson.Set(blockStart, "type", "content_block_start")
+			blockStart, _ = sjson.Set(blockStart, "index", state.ContentBlockIndex)
+			block := `{}`
+			block, _ = sjson.Set(block, "type", "thinking")
+			block, _ = sjson.Set(block, "thinking", "")
+			blockStart, _ = sjson.SetRaw(blockStart, "content_block", block)
+			events = append(events, formatClaudeSSE("content_block_start", blockStart))
+		}
+		blockDelta := `{}`
+		blockDelta, _ = sjson.Set(blockDelta, "type", "content_block_delta")
+		blockDelta, _ = sjson.Set(blockDelta, "index", state.ContentBlockIndex)
+		d := `{}`
+		d, _ = sjson.Set(d, "type", "thinking_delta")
+		d, _ = sjson.Set(d, "thinking", delta)
+		blockDelta, _ = sjson.SetRaw(blockDelta, "delta", d)
+		events = append(events, formatClaudeSSE("content_block_delta", blockDelta))
+
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		if state.InThinkingBlock {
+			blockStop := `{}`
+			blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+			blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+			events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+			state.InThinkingBlock = false
+		}
+
 	case "response.output_text.delta":
 		delta := root.Get("delta").String()
 		if delta == "" {
 			return nil
 		}
 		state.HasText = true
+
+		if state.InThinkingBlock {
+			blockStop := `{}`
+			blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+			blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+			events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+			state.InThinkingBlock = false
+		}
 
 		/* 如果还没开始内容块，先发 content_block_start */
 		if !state.HasStartedContent {
@@ -378,6 +425,14 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 			return nil
 		}
 		state.HasToolUse = true
+
+		if state.InThinkingBlock {
+			blockStop := `{}`
+			blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+			blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+			events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+			state.InThinkingBlock = false
+		}
 
 		/* 先关闭之前的文本内容块（如果有） */
 		if state.HasStartedContent {
@@ -424,6 +479,13 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 
 	case "response.completed":
 		state.Completed = true
+		if state.InThinkingBlock {
+			blockStop := `{}`
+			blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+			blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+			events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+			state.InThinkingBlock = false
+		}
 		/* 关闭最后一个内容块（如果还未关闭） */
 		if state.HasStartedContent {
 			blockStop := `{}`
@@ -451,6 +513,37 @@ func ConvertCodexStreamToClaudeEvents(_ context.Context, rawLine []byte, state *
 		msgStop := `{}`
 		msgStop, _ = sjson.Set(msgStop, "type", "message_stop")
 		events = append(events, formatClaudeSSE("message_stop", msgStop))
+
+	default:
+		if strings.Contains(dataType, "reasoning") && strings.HasSuffix(dataType, ".delta") {
+			delta := root.Get("delta").String()
+			if delta == "" {
+				return nil
+			}
+			state.HasThinking = true
+			if !state.InThinkingBlock {
+				state.ContentBlockIndex++
+				state.InThinkingBlock = true
+				blockStart := `{}`
+				blockStart, _ = sjson.Set(blockStart, "type", "content_block_start")
+				blockStart, _ = sjson.Set(blockStart, "index", state.ContentBlockIndex)
+				block := `{}`
+				block, _ = sjson.Set(block, "type", "thinking")
+				block, _ = sjson.Set(block, "thinking", "")
+				blockStart, _ = sjson.SetRaw(blockStart, "content_block", block)
+				events = append(events, formatClaudeSSE("content_block_start", blockStart))
+			}
+			blockDelta := `{}`
+			blockDelta, _ = sjson.Set(blockDelta, "type", "content_block_delta")
+			blockDelta, _ = sjson.Set(blockDelta, "index", state.ContentBlockIndex)
+			d := `{}`
+			d, _ = sjson.Set(d, "type", "thinking_delta")
+			d, _ = sjson.Set(d, "thinking", delta)
+			blockDelta, _ = sjson.SetRaw(blockDelta, "delta", d)
+			events = append(events, formatClaudeSSE("content_block_delta", blockDelta))
+			return events
+		}
+		return nil
 	}
 
 	return events
@@ -489,6 +582,51 @@ func ConvertCodexNonStreamToClaudeResponse(_ context.Context, rawJSON []byte, mo
 	stopReason := "end_turn"
 	output := resp.Get("output")
 	if output.IsArray() {
+		var thinkingBuilder strings.Builder
+		for _, item := range output.Array() {
+			switch item.Get("type").String() {
+			case "reasoning":
+				if summary := item.Get("summary"); summary.IsArray() {
+					for _, si := range summary.Array() {
+						if si.Get("type").String() == "summary_text" {
+							if t := si.Get("text").String(); t != "" {
+								thinkingBuilder.WriteString(t)
+							}
+						}
+					}
+				}
+				if ct := item.Get("content"); ct.IsArray() {
+					for _, ci := range ct.Array() {
+						ctype := ci.Get("type").String()
+						if ctype == "reasoning_text" || ctype == "text" {
+							if t := ci.Get("text").String(); t != "" {
+								thinkingBuilder.WriteString(t)
+							}
+						}
+					}
+				}
+				if txt := item.Get("text").String(); txt != "" {
+					thinkingBuilder.WriteString(txt)
+				}
+			case "reasoning_text":
+				if t := item.Get("text").String(); t != "" {
+					thinkingBuilder.WriteString(t)
+				}
+				if ct := item.Get("content"); ct.IsArray() {
+					for _, ci := range ct.Array() {
+						if t := ci.Get("text").String(); t != "" {
+							thinkingBuilder.WriteString(t)
+						}
+					}
+				}
+			}
+		}
+		if thinkingBuilder.Len() > 0 {
+			block := `{}`
+			block, _ = sjson.Set(block, "type", "thinking")
+			block, _ = sjson.Set(block, "thinking", thinkingBuilder.String())
+			out, _ = sjson.SetRaw(out, "content.-1", block)
+		}
 		for _, item := range output.Array() {
 			switch item.Get("type").String() {
 			case "message":
@@ -538,6 +676,7 @@ type ClaudeNonStreamResult struct {
 	FoundCompleted bool
 	HasText        bool
 	HasToolUse     bool
+	HasThinking    bool
 }
 
 func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byte, model string) ClaudeNonStreamResult {
@@ -553,6 +692,7 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 
 		hasText := false
 		hasToolUse := false
+		hasThinking := false
 		output := gjson.GetBytes(jsonData, "response.output")
 		if output.IsArray() {
 			for _, item := range output.Array() {
@@ -569,6 +709,8 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 					}
 				case "function_call":
 					hasToolUse = true
+				case "reasoning", "reasoning_text":
+					hasThinking = true
 				}
 			}
 		}
@@ -578,6 +720,7 @@ func ConvertCodexFullSSEToClaudeResponseWithMeta(ctx context.Context, data []byt
 			FoundCompleted: true,
 			HasText:        hasText,
 			HasToolUse:     hasToolUse,
+			HasThinking:    hasThinking,
 		}
 	}
 	return ClaudeNonStreamResult{}
@@ -618,6 +761,40 @@ func SendClaudeError(errType, message string) string {
 	out, _ = sjson.Set(out, "error.type", errType)
 	out, _ = sjson.Set(out, "error.message", message)
 	return out
+}
+
+func GenerateClaudeCloseEvents(state *ClaudeStreamState) []string {
+	var events []string
+	if state.InThinkingBlock {
+		blockStop := `{}`
+		blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+		blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+		events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+		state.InThinkingBlock = false
+	}
+	if state.HasStartedContent {
+		blockStop := `{}`
+		blockStop, _ = sjson.Set(blockStop, "type", "content_block_stop")
+		blockStop, _ = sjson.Set(blockStop, "index", state.ContentBlockIndex)
+		events = append(events, formatClaudeSSE("content_block_stop", blockStop))
+		state.HasStartedContent = false
+	}
+	stopReason := "end_turn"
+	if state.HasToolUse {
+		stopReason = "tool_use"
+	}
+	msgDelta := `{}`
+	msgDelta, _ = sjson.Set(msgDelta, "type", "message_delta")
+	d := `{}`
+	d, _ = sjson.Set(d, "stop_reason", stopReason)
+	msgDelta, _ = sjson.SetRaw(msgDelta, "delta", d)
+	msgDelta, _ = sjson.Set(msgDelta, "usage.output_tokens", 0)
+	events = append(events, formatClaudeSSE("message_delta", msgDelta))
+
+	msgStop := `{}`
+	msgStop, _ = sjson.Set(msgStop, "type", "message_stop")
+	events = append(events, formatClaudeSSE("message_stop", msgStop))
+	return events
 }
 
 /* 确保 time 和 uuid 包在编译时被引用 */

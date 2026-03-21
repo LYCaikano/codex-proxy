@@ -283,9 +283,18 @@ func handleExecutorError(ctx *fasthttp.RequestCtx, err error) {
 		return
 	}
 	if statusErr, ok := err.(*executor.StatusError); ok {
+		if gjson.ValidBytes(statusErr.Body) {
+			if gjson.GetBytes(statusErr.Body, "error").Exists() {
+				ctx.SetContentType("application/json")
+				ctx.SetStatusCode(statusErr.Code)
+				ctx.SetBody(statusErr.Body)
+				return
+			}
+		}
+		msg := summarizeUpstreamError(statusErr.Body)
 		writeJSON(ctx, statusErr.Code, map[string]any{
 			"error": map[string]any{
-				"message": string(statusErr.Body),
+				"message": msg,
 				"type":    "api_error",
 				"code":    fmt.Sprintf("upstream_%d", statusErr.Code),
 			},
@@ -293,6 +302,21 @@ func handleExecutorError(ctx *fasthttp.RequestCtx, err error) {
 		return
 	}
 	sendError(ctx, fasthttp.StatusInternalServerError, err.Error(), "server_error")
+}
+
+func summarizeUpstreamError(body []byte) string {
+	if len(body) == 0 {
+		return "(empty upstream response)"
+	}
+	if gjson.ValidBytes(body) {
+		if msg := gjson.GetBytes(body, "detail").String(); msg != "" {
+			return msg
+		}
+	}
+	if len(body) > 200 {
+		return string(body[:200]) + "..."
+	}
+	return string(body)
 }
 
 /**
@@ -326,7 +350,7 @@ func (h *ProxyHandler) handleChatCompletions(ctx *fasthttp.RequestCtx) {
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
-	log.Infof("收到请求: model=%s, stream=%v", model, stream)
+	log.Debugf("收到请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
 
@@ -468,7 +492,7 @@ func (h *ProxyHandler) handleResponses(ctx *fasthttp.RequestCtx) {
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
-	log.Infof("收到 Responses 请求: model=%s, stream=%v", model, stream)
+	log.Debugf("收到 Responses 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
 
@@ -507,7 +531,6 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 			_ = conn.Close()
 		}()
 
-		inProgress := false
 		for {
 			msgType, message, readErr := conn.ReadMessage()
 			if readErr != nil {
@@ -521,11 +544,6 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 			eventType := gjson.GetBytes(message, "type").String()
 			switch eventType {
 			case "response.create":
-				if inProgress {
-					h.writeWSError(conn, "invalid_request_error", "同一连接不允许并发 response.create")
-					continue
-				}
-
 				respObj := gjson.GetBytes(message, "response")
 				if !respObj.Exists() {
 					h.writeWSError(conn, "invalid_request_error", "缺少 response 字段")
@@ -541,31 +559,25 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 					continue
 				}
 
-				inProgress = true
-				log.Infof("responses ws: 上游 WS 不可用或未启用，回退 HTTP/SSE 转发")
+				log.Debugf("responses ws: model=%s", model)
 				rc := h.buildRetryConfig()
 				streamErr := h.forwardResponsesSSEAsWS(ctx, conn, rc, requestBody, model)
-				inProgress = false
 				if streamErr == nil {
 					RecordRequest()
-				}
-				if streamErr != nil {
-					if errors.Is(streamErr, executor.ErrEmptyResponse) {
-						h.writeWSError(conn, "invalid_response", "empty response")
-						_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "empty response"), time.Now().Add(2*time.Second))
-						return
-					}
+				} else if errors.Is(streamErr, executor.ErrEmptyResponse) {
+					h.writeWSError(conn, "invalid_response", "empty response")
+				} else if statusErr, ok := streamErr.(*executor.StatusError); ok {
+					h.writeWSError(conn, "api_error", summarizeUpstreamError(statusErr.Body))
+				} else {
 					h.writeWSError(conn, "api_error", streamErr.Error())
-					return
 				}
-				return
 
 			case "response.cancel", "response.close":
 				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closed"), time.Now().Add(2*time.Second))
 				return
 
 			default:
-				h.writeWSError(conn, "invalid_request_error", "不支持的事件类型")
+				h.writeWSError(conn, "invalid_request_error", "不支持的事件类型: "+eventType)
 			}
 		}
 	})
@@ -576,21 +588,65 @@ func (h *ProxyHandler) handleResponsesWS(ctx *fasthttp.RequestCtx) {
 
 func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websocket.Conn, rc executor.RetryConfig, requestBody []byte, model string) error {
 	startTotal := time.Now()
-	rawResp, account, attempts, baseModel, convertDur, sendDur, err := h.executor.OpenResponsesStream(ctx, rc, requestBody, model)
-	if err != nil {
-		return err
+	emptyRetryMax := h.emptyRetryMax
+	if emptyRetryMax < 0 {
+		emptyRetryMax = 0
 	}
+	excludedForEmpty := make(map[string]bool)
+
+	for emptyAttempt := 0; emptyAttempt <= emptyRetryMax; emptyAttempt++ {
+		rcExcl := rc
+		if len(excludedForEmpty) > 0 {
+			origPick := rc.PickFn
+			rcExcl.PickFn = func(m string, excl map[string]bool) (*auth.Account, error) {
+				for k := range excludedForEmpty {
+					excl[k] = true
+				}
+				return origPick(m, excl)
+			}
+		}
+
+		rawResp, account, attempts, baseModel, convertDur, sendDur, err := h.executor.OpenResponsesStream(ctx, rcExcl, requestBody, model)
+		if err != nil {
+			return err
+		}
+
+		hasContent, streamErr := h.pipeSSEToWS(conn, rawResp, ctx)
+		if streamErr != nil {
+			log.Infof("req summary responses-ws model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+			return streamErr
+		}
+
+		if hasContent {
+			account.RecordSuccess()
+			log.Infof("req summary responses-ws model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
+			return nil
+		}
+
+		excludedForEmpty[account.FilePath] = true
+		if emptyAttempt < emptyRetryMax {
+			log.Warnf("WS 空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
+		}
+	}
+
+	log.Infof("req summary responses-ws (empty after %d tries) total=%v", emptyRetryMax+1, time.Since(startTotal))
+	return executor.ErrEmptyResponse
+}
+
+func (h *ProxyHandler) pipeSSEToWS(conn *websocket.Conn, rawResp *executor.RawResponse, ctx context.Context) (bool, error) {
 	defer func() {
 		if rawResp.Body != nil {
 			_ = rawResp.Body.Close()
 		}
 	}()
 
-	hasText := false
-	hasTool := false
+	hasContent := false
+	flushed := false
+	var buffer [][]byte
 
 	scanner := bufio.NewScanner(rawResp.Body)
 	scanner.Buffer(make([]byte, scannerInitSize), scannerMaxSize)
+
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -601,34 +657,50 @@ func (h *ProxyHandler) forwardResponsesSSEAsWS(ctx context.Context, conn *websoc
 			continue
 		}
 
-		typ := gjson.GetBytes(payload, "type").String()
-		switch typ {
-		case "response.output_text.delta":
-			if gjson.GetBytes(payload, "delta").String() != "" {
-				hasText = true
+		if !hasContent {
+			typ := gjson.GetBytes(payload, "type").String()
+			switch typ {
+			case "response.output_text.delta":
+				if gjson.GetBytes(payload, "delta").String() != "" {
+					hasContent = true
+				}
+			case "response.output_item.added", "response.function_call_arguments.delta",
+				"response.function_call_arguments.done", "response.output_item.done":
+				hasContent = true
+			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+				hasContent = true
 			}
-		case "response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done":
-			hasTool = true
 		}
 
-		if writeErr := conn.WriteMessage(websocket.TextMessage, payload); writeErr != nil {
-			return writeErr
+		if !flushed && hasContent {
+			for _, buf := range buffer {
+				if writeErr := conn.WriteMessage(websocket.TextMessage, buf); writeErr != nil {
+					return true, writeErr
+				}
+			}
+			buffer = nil
+			flushed = true
+		}
+
+		if flushed {
+			if writeErr := conn.WriteMessage(websocket.TextMessage, payload); writeErr != nil {
+				return hasContent, writeErr
+			}
+		} else {
+			payloadCopy := make([]byte, len(payload))
+			copy(payloadCopy, payload)
+			buffer = append(buffer, payloadCopy)
 		}
 	}
 
 	if scanErr := scanner.Err(); scanErr != nil {
-		log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-		return scanErr
+		if errors.Is(scanErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return hasContent, nil
+		}
+		return hasContent, scanErr
 	}
 
-	if !hasText && !hasTool {
-		log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-		return executor.ErrEmptyResponse
-	}
-
-	account.RecordSuccess()
-	log.Infof("req summary responses-ws-fallback model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
-	return nil
+	return hasContent, nil
 }
 
 func (h *ProxyHandler) writeWSError(conn *websocket.Conn, errType, message string) {
@@ -657,7 +729,7 @@ func (h *ProxyHandler) handleResponsesCompact(ctx *fasthttp.RequestCtx) {
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
-	log.Infof("收到 Responses Compact 请求: model=%s, stream=%v", model, stream)
+	log.Debugf("收到 Responses Compact 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
 

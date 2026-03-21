@@ -17,6 +17,7 @@ import (
 	"codex-proxy/internal/translator"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/valyala/fasthttp"
 )
 
@@ -37,7 +38,7 @@ func (h *ProxyHandler) handleMessages(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	log.Infof("收到 Claude Messages 请求: model=%s, stream=%v", model, stream)
+	log.Debugf("收到 Claude Messages 请求: model=%s, stream=%v", model, stream)
 
 	rc := h.buildRetryConfig()
 
@@ -110,8 +111,15 @@ func (h *ProxyHandler) executeClaudeStream(ctx *fasthttp.RequestCtx, rc executor
 			log.Errorf("Claude 读取流式响应失败: %v", scanErr)
 			return
 		}
-		if !state.HasText && !state.HasToolUse {
+		if !state.HasText && !state.HasToolUse && !state.HasThinking {
 			return
+		}
+		if !state.Completed {
+			closeEvents := translator.GenerateClaudeCloseEvents(state)
+			for _, event := range closeEvents {
+				_, _ = io.WriteString(writer, event)
+			}
+			writer.Flush()
 		}
 		account.RecordSuccess()
 	})
@@ -153,7 +161,7 @@ func (h *ProxyHandler) executeClaudeNonStream(ctx *fasthttp.RequestCtx, rc execu
 	if !result.FoundCompleted || result.JSON == "" {
 		return fmt.Errorf("未收到 response.completed 事件")
 	}
-	if !result.HasText && !result.HasToolUse {
+	if !result.HasText && !result.HasToolUse && !result.HasThinking {
 		return executor.ErrEmptyResponse
 	}
 
@@ -175,7 +183,15 @@ func handleClaudeExecutorError(ctx *fasthttp.RequestCtx, err error) {
 		return
 	}
 	if statusErr, ok := err.(*executor.StatusError); ok {
-		sendClaudeError(ctx, statusErr.Code, "api_error", string(statusErr.Body))
+		msg := string(statusErr.Body)
+		if gjson.ValidBytes(statusErr.Body) {
+			if errMsg := gjson.GetBytes(statusErr.Body, "error.message"); errMsg.Exists() {
+				msg = errMsg.String()
+			} else if detail := gjson.GetBytes(statusErr.Body, "detail"); detail.Exists() {
+				msg = detail.String()
+			}
+		}
+		sendClaudeError(ctx, statusErr.Code, "api_error", msg)
 		return
 	}
 	sendClaudeError(ctx, fasthttp.StatusInternalServerError, "api_error", err.Error())

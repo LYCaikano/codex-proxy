@@ -210,13 +210,13 @@ func ConvertStreamChunk(_ context.Context, rawLine []byte, state *StreamState, r
 		}
 
 	case "response.output_text.delta":
-		if delta := root.Get("delta"); delta.Exists() {
-			if delta.String() != "" {
-				state.HasText = true
-			}
-			tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
-			tpl, _ = sjson.Set(tpl, "choices.0.delta.content", delta.String())
+		delta := root.Get("delta").String()
+		if delta == "" {
+			return nil
 		}
+		state.HasText = true
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.role", "assistant")
+		tpl, _ = sjson.Set(tpl, "choices.0.delta.content", delta)
 
 	case "response.completed":
 		state.Completed = true
@@ -493,7 +493,11 @@ func ConvertNonStreamResponse(_ context.Context, rawJSON []byte, reverseToolMap 
 
 	/* finish_reason */
 	if resp.Get("status").String() == "completed" {
-		tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "stop")
+		if gjson.Get(tpl, "choices.0.message.tool_calls").Exists() {
+			tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "tool_calls")
+		} else {
+			tpl, _ = sjson.Set(tpl, "choices.0.finish_reason", "stop")
+		}
 	}
 
 	return tpl, hasOutput

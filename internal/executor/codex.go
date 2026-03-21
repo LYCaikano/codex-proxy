@@ -177,6 +177,13 @@ const enhanceYourCalmHint = "（上游限流：可调低 max-conns-per-host / ma
 /**
  * wrapReadErr 若为 HTTP/2 GOAWAY ENHANCE_YOUR_CALM，附加说明便于排查
  */
+func contextWithOptionalTimeout(parent context.Context, timeoutSec int) (context.Context, context.CancelFunc) {
+	if timeoutSec > 0 {
+		return context.WithTimeout(parent, time.Duration(timeoutSec)*time.Second)
+	}
+	return parent, func() {}
+}
+
 func wrapReadErr(err error) error {
 	if err == nil {
 		return nil
@@ -227,10 +234,21 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 	excluded := make(map[string]bool)
 	maxAttempts := rc.MaxRetry + 1
 	var lastErr error
+	var activeCancel context.CancelFunc
+	defer func() {
+		if activeCancel != nil {
+			activeCancel()
+		}
+	}()
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if ctx.Err() != nil {
 			break
+		}
+
+		if activeCancel != nil {
+			activeCancel()
+			activeCancel = nil
 		}
 
 		pickStart := time.Now()
@@ -247,16 +265,8 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		log.Debugf("send attempt %d/%d account=%s model=%s stream=%v", attempt+1, maxAttempts, account.GetEmail(), model, stream)
 
 		buildStart := time.Now()
-		reqCtx := ctx
-		var reqCancel context.CancelFunc
-		if rc.UpstreamTimeoutSec > 0 {
-			reqCtx, reqCancel = context.WithTimeout(ctx, time.Duration(rc.UpstreamTimeoutSec)*time.Second)
-		}
-		defer func() {
-			if reqCancel != nil {
-				reqCancel()
-			}
-		}()
+		reqCtx, cancel := contextWithOptionalTimeout(ctx, rc.UpstreamTimeoutSec)
+		activeCancel = cancel
 		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(codexBody))
 		if err != nil {
 			return nil, nil, attempt + 1, fmt.Errorf("创建请求失败: %w", err)
@@ -264,7 +274,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		applyCodexHeaders(httpReq, account, stream)
 		buildDur := time.Since(buildStart)
 		dialTarget := effectiveDialTarget(httpReq.URL, e.resolveAddr)
-		log.Infof("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attempt+1, maxAttempts, httpReq.Method, httpReq.URL.String(), dialTarget)
+		log.Debugf("upstream request model=%s stream=%v account=%s attempt=%d/%d method=%s url=%s dial_target=%s", model, stream, account.GetEmail(), attempt+1, maxAttempts, httpReq.Method, httpReq.URL.String(), dialTarget)
 
 		doStart := time.Now()
 		httpResp, err := e.httpClient.Do(httpReq)
@@ -272,7 +282,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 		if err != nil {
 			account.RecordFailure()
 			lastErr = fmt.Errorf("请求发送失败: %w", err)
-			log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), err)
+			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=ERR err=%v", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), err)
 			if attempt < maxAttempts-1 {
 				log.Warnf("账号 [%s] 网络错误，切换账号重试: %v (elapsed=%v)", account.GetEmail(), err, time.Since(startAttempt).Round(time.Millisecond))
 				continue
@@ -280,15 +290,13 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			break
 		}
 
-		/* 2xx 成功：不取消 reqCtx，调用方会继续读 Body；避免 defer 里 cancel 影响读 Body */
 		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
-			reqCancel = nil
-			log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
+			activeCancel = nil
+			log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 			log.Debugf("send attempt success status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
 			return httpResp, account, attempt + 1, nil
 		}
 
-		/* 错误状态码：读取错误体、处理账号状态、判断是否可重试 */
 		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 		_ = httpResp.Body.Close()
 
@@ -300,7 +308,7 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 
 		statusErr := &StatusError{Code: httpResp.StatusCode, Body: errBody}
 		lastErr = statusErr
-		log.Infof("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
+		log.Debugf("send stage model=%s account=%s attempt=%d/%d pick=%v build=%v upstream_wait=%v total=%v status=%d", model, account.GetEmail(), attempt+1, maxAttempts, pickDur, buildDur, doDur, time.Since(startAttempt), httpResp.StatusCode)
 
 		if !IsRetryableStatus(httpResp.StatusCode) {
 			log.Debugf("send attempt non-retryable status=%d account=%s elapsed=%v", httpResp.StatusCode, account.GetEmail(), time.Since(startAttempt).Round(time.Millisecond))
@@ -425,6 +433,25 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		}
 		log.Infof("req summary stream model=%s account=%s attempts=%d convert=%v upstream_ttfb=%v first_chunk=%v to_completed=%v tail_after_completed=%v stream=%v chunks=%d total=%v (empty)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, firstChunkDur, completedDur, tailAfterCompleted, time.Since(streamStart), chunkCount, time.Since(startTotal))
 		return ErrEmptyResponse
+	}
+
+	if !state.Completed {
+		finishReason := "stop"
+		if state.FunctionCallIndex != -1 {
+			finishReason = "tool_calls"
+		}
+		synth := `{"id":"","object":"chat.completion.chunk","created":0,"model":"","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+		synth, _ = sjson.Set(synth, "id", state.ResponseID)
+		synth, _ = sjson.Set(synth, "created", state.CreatedAt)
+		synth, _ = sjson.Set(synth, "model", state.Model)
+		synth, _ = sjson.Set(synth, "choices.0.finish_reason", finishReason)
+		chunkCount++
+		_, _ = writer.Write(sseDataPrefix)
+		_, _ = io.WriteString(writer, synth)
+		_, _ = writer.Write(sseDataSuffix)
+		if canFlush {
+			flusher.Flush()
+		}
 	}
 
 	doneWriteStart := time.Now()

@@ -159,13 +159,6 @@ func main() {
 		close(dbInitDone)
 	}
 
-	/* 初始化账号管理器 */
-	var selector auth.Selector
-	if cfg.Selector == "quota-first" {
-		selector = auth.NewQuotaFirstSelector()
-	} else {
-		selector = auth.NewRoundRobinSelector()
-	}
 	/* 等待数据库初始化完成（如果启用） */
 	<-dbInitDone
 
@@ -359,12 +352,22 @@ func fasthttpLogger(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 			methodColor = colorYellow
 		}
 
-		log.Infof("%s%s%s %s%d%s %s%s%s %s%v%s %s",
-			methodColor, method, colorReset,
-			statusColor, status, colorReset,
-			colorWhite, path, colorReset,
-			colorGray, latency.Round(time.Millisecond), colorReset,
-			fmt.Sprintf("%s%s%s", colorGray, client, colorReset),
-		)
+		if status >= 400 {
+			log.Warnf("%s%s%s %s%d%s %s%s%s %s%v%s %s",
+				methodColor, method, colorReset,
+				statusColor, status, colorReset,
+				colorWhite, path, colorReset,
+				colorGray, latency.Round(time.Millisecond), colorReset,
+				fmt.Sprintf("%s%s%s", colorGray, client, colorReset),
+			)
+		} else {
+			log.Debugf("%s%s%s %s%d%s %s%s%s %s%v%s %s",
+				methodColor, method, colorReset,
+				statusColor, status, colorReset,
+				colorWhite, path, colorReset,
+				colorGray, latency.Round(time.Millisecond), colorReset,
+				fmt.Sprintf("%s%s%s", colorGray, client, colorReset),
+			)
+		}
 	}
 }
