@@ -121,16 +121,7 @@ jobs:
           else
             git log "${CURRENT_TAG}" --reverse --pretty=format:'%h %s' > commit_list_plain.txt
           fi
-
-      # 默认 GITHUB_TOKEN 无 Copilot 权限：需在仓库 Secrets 添加 COPILOT_GITHUB_TOKEN（细粒度 PAT，勾选 Copilot Requests）
-      # 文档: https://docs.github.com/copilot/how-tos/copilot-cli/automate-copilot-cli/automate-with-actions
-      - uses: actions/setup-node@v4
-        if: ${{ secrets.COPILOT_GITHUB_TOKEN != '' }}
-        with:
-          node-version: "22"
-
       - name: GitHub Copilot CLI 生成发行摘要（可选）
-        if: ${{ secrets.COPILOT_GITHUB_TOKEN != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
@@ -138,21 +129,22 @@ jobs:
           NO_COLOR: "1"
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "未配置 secret COPILOT_GITHUB_TOKEN，跳过 Copilot 摘要（仍为完整提交记录 + GitHub 自动生成块）"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "未配置 secret COPILOT_GITHUB_TOKEN，跳过 Copilot 摘要"
             exit 0
           fi
           if [ ! -s commit_list_plain.txt ]; then
             exit 0
           fi
-          npm install -g @github/copilot@latest
-          export PATH="$(npm prefix -g)/bin:$PATH"
+          curl -fsSL https://gh.io/copilot-install | PREFIX="$HOME/.local" bash
+          export PATH="$HOME/.local/bin:$PATH"
           set +e
-          head -c 120000 commit_list_plain.txt | copilot -p "以下是本版本 Git 提交列表（stdin，每行：短哈希 + 标题）。请只输出 Markdown：以「## Copilot 摘要」为二级标题，下列中文无序列表，归纳可验证的变更（可合并同类项，约 24 条内）。禁止编造提交中未体现的内容。" --no-ask-user > copilot_summary.md 2>&1
+          head -c 120000 commit_list_plain.txt | copilot -p "以下是本版本 Git 提交列表（stdin，每行：短哈希 + 标题）。请只输出 Markdown：二级标题「## Copilot 摘要」，下列中文无序列表归纳可验证的变更（可合并同类项，约 24 条内）。禁止编造提交中未体现的内容。" --no-ask-user > copilot_summary.md 2>&1
           rc=$?
           set -e
           if [ "$rc" != 0 ] || [ ! -s copilot_summary.md ]; then
-            echo "Copilot CLI 失败 (exit $rc) 或无输出，发布说明不含 AI 摘要"
+            echo "Copilot CLI 失败 (exit $rc) 或无输出，发布说明不含 Copilot 摘要"
+            head -c 2000 copilot_summary.md 2>/dev/null || true
             rm -f copilot_summary.md
             exit 0
           fi
