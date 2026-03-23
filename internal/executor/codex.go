@@ -455,6 +455,8 @@ func (e *Executor) ExecuteStream(ctx context.Context, rc RetryConfig, requestBod
 		return wrapReadErr(err)
 	}
 	if !state.HasText && !state.HasToolCall && !state.HasReasoning {
+		/* 空回答时，标记账号失败以避免后续请求继续使用该账号 */
+		account.RecordFailure()
 		firstChunkDur := time.Duration(0)
 		completedDur := time.Duration(0)
 		tailAfterCompleted := time.Duration(0)
@@ -567,6 +569,11 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 				continue
 			}
+			resStr, hasOutput := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
+			if !hasOutput {
+				break
+			}
+			/* 仅在有有效输出时才记录 usage */
 			usage := gjson.GetBytes(jsonData, "response.usage")
 			if usage.Exists() {
 				account.RecordUsage(
@@ -574,10 +581,6 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 					usage.Get("output_tokens").Int(),
 					usage.Get("total_tokens").Int(),
 				)
-			}
-			resStr, hasOutput := translator.ConvertNonStreamResponse(ctx, jsonData, reverseToolMap)
-			if !hasOutput {
-				break
 			}
 			if resStr != "" {
 				result = []byte(resStr)
@@ -592,6 +595,8 @@ func (e *Executor) ExecuteNonStream(ctx context.Context, rc RetryConfig, request
 			log.Infof("req summary nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return result, nil
 		}
+		/* 空回答时标记账号失败，防止下一个请求继续选择该账号 */
+		account.RecordFailure()
 		excludedForEmpty[account.FilePath] = true
 		if emptyAttempt < emptyRetryMax {
 			log.Warnf("非流式空返回，换号重试 (account=%s attempt=%d/%d)", account.GetEmail(), emptyAttempt+1, emptyRetryMax+1)
@@ -704,16 +709,16 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 		if gjson.GetBytes(jsonData, "type").String() != "response.completed" {
 			continue
 		}
-		/* 提取 usage 并记录 */
-		usage := gjson.GetBytes(jsonData, "response.usage")
-		if usage.Exists() {
-			account.RecordUsage(
-				usage.Get("input_tokens").Int(),
-				usage.Get("output_tokens").Int(),
-				usage.Get("total_tokens").Int(),
-			)
-		}
 		if resp := gjson.GetBytes(jsonData, "response"); resp.Exists() {
+			/* 仅在响应存在时才记录 usage */
+			usage := gjson.GetBytes(jsonData, "response.usage")
+			if usage.Exists() {
+				account.RecordUsage(
+					usage.Get("input_tokens").Int(),
+					usage.Get("output_tokens").Int(),
+					usage.Get("total_tokens").Int(),
+				)
+			}
 			account.RecordSuccess()
 			log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 			return []byte(resp.Raw), nil
@@ -721,10 +726,12 @@ func (e *Executor) ExecuteResponsesNonStream(ctx context.Context, rc RetryConfig
 	}
 
 	if err = scanner.Err(); err != nil {
+		account.RecordFailure()
 		log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (ERR)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 		return nil, fmt.Errorf("读取响应失败: %w", wrapReadErr(err))
 	}
 
+	account.RecordFailure()
 	log.Infof("req summary responses-nonstream model=%s account=%s attempts=%d convert=%v upstream=%v total=%v (no completed)", baseModel, account.GetEmail(), attempts, convertDur, sendDur, time.Since(startTotal))
 	return nil, fmt.Errorf("未收到 response.completed 事件")
 }
