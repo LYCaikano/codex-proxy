@@ -210,8 +210,8 @@ func (m *Manager) prepareDBStatements() error {
 	switch m.dbDialect {
 	case codexdb.DialectMySQL:
 		s := `
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES (?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6))
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6))
 ON DUPLICATE KEY UPDATE
 	email = VALUES(email),
 	account_id = VALUES(account_id),
@@ -221,6 +221,10 @@ ON DUPLICATE KEY UPDATE
 	expire = VALUES(expire),
 	plan_type = VALUES(plan_type),
 	last_refresh = VALUES(last_refresh),
+	status = VALUES(status),
+	cooldown_until = VALUES(cooldown_until),
+	disable_reason = VALUES(disable_reason),
+	last_used_at = VALUES(last_used_at),
 	updated_at = VALUES(updated_at)`
 		stmt, err := m.db.Prepare(s)
 		if err != nil {
@@ -231,8 +235,8 @@ ON DUPLICATE KEY UPDATE
 		return nil
 	case codexdb.DialectSQLite:
 		s1 := `
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
 ON CONFLICT(account_id) DO UPDATE SET
 	email = excluded.email,
 	id_token = excluded.id_token,
@@ -241,6 +245,10 @@ ON CONFLICT(account_id) DO UPDATE SET
 	expire = excluded.expire,
 	plan_type = excluded.plan_type,
 	last_refresh = excluded.last_refresh,
+	status = excluded.status,
+	cooldown_until = excluded.cooldown_until,
+	disable_reason = excluded.disable_reason,
+	last_used_at = excluded.last_used_at,
 	updated_at = CURRENT_TIMESTAMP`
 		stmt, err := m.db.Prepare(s1)
 		if err != nil {
@@ -248,8 +256,8 @@ ON CONFLICT(account_id) DO UPDATE SET
 		}
 		m.saveTokenStmt = stmt
 		s2 := `
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
 ON CONFLICT(email) DO UPDATE SET
 	account_id = excluded.account_id,
 	id_token = excluded.id_token,
@@ -258,6 +266,10 @@ ON CONFLICT(email) DO UPDATE SET
 	expire = excluded.expire,
 	plan_type = excluded.plan_type,
 	last_refresh = excluded.last_refresh,
+	status = excluded.status,
+	cooldown_until = excluded.cooldown_until,
+	disable_reason = excluded.disable_reason,
+	last_used_at = excluded.last_used_at,
 	updated_at = CURRENT_TIMESTAMP`
 		stmtEm, err := m.db.Prepare(s2)
 		if err != nil {
@@ -267,8 +279,8 @@ ON CONFLICT(email) DO UPDATE SET
 		return nil
 	default:
 		s1 := `
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
 ON CONFLICT (account_id) DO UPDATE SET
 	email = EXCLUDED.email,
 	id_token = EXCLUDED.id_token,
@@ -277,6 +289,10 @@ ON CONFLICT (account_id) DO UPDATE SET
 	expire = EXCLUDED.expire,
 	plan_type = EXCLUDED.plan_type,
 	last_refresh = EXCLUDED.last_refresh,
+	status = EXCLUDED.status,
+	cooldown_until = EXCLUDED.cooldown_until,
+	disable_reason = EXCLUDED.disable_reason,
+	last_used_at = EXCLUDED.last_used_at,
 	updated_at = NOW()`
 		stmt, err := m.db.Prepare(s1)
 		if err != nil {
@@ -284,8 +300,8 @@ ON CONFLICT (account_id) DO UPDATE SET
 		}
 		m.saveTokenStmt = stmt
 		s2 := `
-INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+INSERT INTO codex_accounts (account_id,email,id_token,access_token,refresh_token,expire,plan_type,last_refresh,status,cooldown_until,disable_reason,last_used_at,updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
 ON CONFLICT (email) DO UPDATE SET
 	account_id = EXCLUDED.account_id,
 	id_token = EXCLUDED.id_token,
@@ -294,6 +310,10 @@ ON CONFLICT (email) DO UPDATE SET
 	expire = EXCLUDED.expire,
 	plan_type = EXCLUDED.plan_type,
 	last_refresh = EXCLUDED.last_refresh,
+	status = EXCLUDED.status,
+	cooldown_until = EXCLUDED.cooldown_until,
+	disable_reason = EXCLUDED.disable_reason,
+	last_used_at = EXCLUDED.last_used_at,
 	updated_at = NOW()`
 		stmtEm, err := m.db.Prepare(s2)
 		if err != nil {
