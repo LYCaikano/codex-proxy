@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -50,12 +51,21 @@ func main() {
 	})
 
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
+	toJSON := flag.Bool("tojson", false, "将数据库账号导出为 JSON 文件到 auth-dir 目录（需配置数据库连接）")
 	flag.Parse()
 
 	/* 加载配置 */
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	/* 处理 --tojson 导出功能 */
+	if *toJSON {
+		if err := exportAccountsToJSON(cfg); err != nil {
+			log.Fatalf("导出账号失败: %v", err)
+		}
+		return
 	}
 
 	log.Infof("%s⚡ Codex Proxy 启动中...%s", colorCyan, colorReset)
@@ -388,4 +398,175 @@ func fasthttpLogger(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 			)
 		}
 	}
+}
+
+/**
+ * exportAccountsToJSON 将数据库中的账号导出为 JSON 文件到 auth-dir 目录
+ * @param cfg - 配置对象
+ * @return error - 导出出错则返回错误
+ */
+func exportAccountsToJSON(cfg *config.Config) error {
+	authDir := strings.TrimSpace(cfg.AuthDir)
+	if authDir == "" {
+		return fmt.Errorf("auth-dir 未配置，无法导出账号")
+	}
+
+	/* 创建 auth-dir 目录（如果不存在） */
+	if err := os.MkdirAll(authDir, 0755); err != nil {
+		return fmt.Errorf("创建 auth-dir 目录失败: %v", err)
+	}
+
+	log.Infof("%s📤 开始导出账号到 JSON...%s", colorCyan, colorReset)
+
+	/* 连接数据库 */
+	db, dialect, err := codexdb.Open(cfg)
+	if err != nil {
+		return fmt.Errorf("数据库连接失败: %v", err)
+	}
+	defer db.Close()
+
+	/* 从数据库读取所有账号 */
+	accounts, err := loadAllAccountsFromDB(db, dialect)
+	if err != nil {
+		return fmt.Errorf("从数据库读取账号失败: %v", err)
+	}
+
+	if len(accounts) == 0 {
+		log.Warnf("数据库中没有账号数据")
+		return nil
+	}
+
+	/* 遍历账号，转换成 JSON 并写入文件 */
+	successCount := 0
+	failCount := 0
+	for _, acc := range accounts {
+		/* 生成文件名：优先用邮箱，其次用 account_id，都没有则用 filepath 中提取的名称 */
+		var filename string
+		email := strings.TrimSpace(acc.Token.Email)
+		accountID := strings.TrimSpace(acc.Token.AccountID)
+
+		if email != "" {
+			filename = email + ".json"
+		} else if accountID != "" {
+			filename = accountID + ".json"
+		} else if acc.FilePath != "" {
+			filename = acc.FilePath
+		} else {
+			log.Warnf("账号信息不完整（无邮箱、ID 或路径），跳过")
+			failCount++
+			continue
+		}
+
+		/* 转换成 TokenFile 格式供导出 */
+		tokenFile := auth.TokenFile{
+			IDToken:      acc.Token.IDToken,
+			AccessToken:  acc.Token.AccessToken,
+			RefreshToken: acc.Token.RefreshToken,
+			AccountID:    acc.Token.AccountID,
+			Email:        acc.Token.Email,
+			Type:         "codex",
+			Expire:       acc.Token.Expire,
+		}
+		tokenFile.LastRefresh = acc.LastRefreshedAt.Format(time.RFC3339)
+
+		/* 序列化为 JSON */
+		jsonData, err := json.MarshalIndent(tokenFile, "", "  ")
+		if err != nil {
+			log.Warnf("序列化账号 %s 失败: %v", email, err)
+			failCount++
+			continue
+		}
+
+		/* 写入文件 */
+		filepath := authDir + "/" + filename
+		if err := os.WriteFile(filepath, jsonData, 0600); err != nil {
+			log.Warnf("写入文件 %s 失败: %v", filepath, err)
+			failCount++
+			continue
+		}
+
+		log.Infof("已导出: %s (%s)", filename, email)
+		successCount++
+	}
+
+	log.Infof("%s✅ 导出完成: 成功 %d 个，失败 %d 个%s", colorGreen, successCount, failCount, colorReset)
+	return nil
+}
+
+/**
+ * loadAllAccountsFromDB 从数据库读取所有账号
+ * 这是一个轻量级版本，仅用于导出，不初始化选择器等复杂逻辑
+ *
+ * @param db - 数据库连接
+ * @param dialect - 数据库方言
+ * @return []*auth.Account - 账号列表
+ * @return error - 读取出错
+ */
+func loadAllAccountsFromDB(db *sql.DB, dialect codexdb.Dialect) ([]*auth.Account, error) {
+	/* 使用 account_id 和 email 作为唯一标识，而非 file_path（数据库中无此列） */
+	rows, err := db.Query(`
+		SELECT id, account_id, email, id_token, access_token, refresh_token, 
+		       expire, last_refresh, status, cooldown_until, disable_reason, last_used_at
+		FROM codex_accounts
+		ORDER BY id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("数据库查询失败: %v", err)
+	}
+	defer rows.Close()
+
+	var accounts []*auth.Account
+	for rows.Next() {
+		var (
+			id                                                                          int64
+			accountID, email, idToken, accessToken, refreshToken, expire, disableReason sql.NullString
+			lastRefresh, cooldownUntil, lastUsedAt                                      sql.NullTime
+			status                                                                      sql.NullInt32
+		)
+
+		if err := rows.Scan(
+			&id, &accountID, &email, &idToken, &accessToken, &refreshToken,
+			&expire, &lastRefresh, &status, &cooldownUntil, &disableReason, &lastUsedAt,
+		); err != nil {
+			log.Warnf("扫描数据库行失败: %v", err)
+			continue
+		}
+
+		/* 构建 Account 对象 */
+		acc := &auth.Account{
+			FilePath: "", /* 数据库中无此列，导出时用邮箱或 account_id 作文件名 */
+			Token: auth.TokenData{
+				IDToken:      idToken.String,
+				AccessToken:  accessToken.String,
+				RefreshToken: refreshToken.String,
+				AccountID:    accountID.String,
+				Email:        email.String,
+				Expire:       expire.String,
+			},
+		}
+
+		if lastRefresh.Valid {
+			acc.LastRefreshedAt = lastRefresh.Time
+		}
+		if status.Valid {
+			acc.Status = auth.AccountStatus(status.Int32)
+		}
+		if cooldownUntil.Valid {
+			acc.CooldownUntil = cooldownUntil.Time
+		}
+		if lastUsedAt.Valid {
+			acc.LastUsedAt = lastUsedAt.Time
+		}
+		if disableReason.Valid {
+			acc.DisableReason = disableReason.String
+		}
+
+		accounts = append(accounts, acc)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("行迭代错误: %v", err)
+	}
+
+	return accounts, nil
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-proxy/internal/auth"
@@ -61,16 +62,24 @@ var responsesWSUpgrader = websocket.FastHTTPUpgrader{
  * @field executor - Codex 执行器
  * @field apiKeys - 允许访问的 API Key 列表（为空则不鉴权）
  * @field maxRetry - 请求失败最大重试次数（切换账号重试）
+ * @field auth401RecoverTracks - 追踪账号 401 恢复的次数和时间，防止陷入快速循环
  */
 type ProxyHandler struct {
-	manager            *auth.Manager
-	executor           *executor.Executor
-	apiKeys            []string
-	maxRetry           int
-	enableHealthyRetry bool
-	quotaChecker       *auth.QuotaChecker
-	indexHTML          []byte
-	emptyRetryMax      int
+	manager              *auth.Manager
+	executor             *executor.Executor
+	apiKeys              []string
+	maxRetry             int
+	enableHealthyRetry   bool
+	quotaChecker         *auth.QuotaChecker
+	indexHTML            []byte
+	emptyRetryMax        int
+	auth401RecoverTracks sync.Map /* key: filePath, value: *auth401RecoverTrack */
+}
+
+/* auth401RecoverTrack 追踪单个账号的 401 恢复情况 */
+type auth401RecoverTrack struct {
+	count     int       /* 在当前时间窗口内的恢复次数 */
+	startTime time.Time /* 时间窗口开始时间 */
 }
 
 /**
@@ -284,8 +293,18 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 			return h.manager.PickExcluding(model, excluded)
 		},
 		On401Fn: func(acc *auth.Account) bool {
+			/* 限制同一账号在 30 秒内最多刷新 2 次，防止陷入快速 401→刷新 循环 */
+			if !h.canPerformAuth401Recover(acc) {
+				log.Warnf("账号 [%s] 在 30 秒内刷新次数过多（>2 次），直接换号", acc.GetEmail())
+				return false
+			}
+
 			r := h.manager.HandleAuth401(acc, h.quotaChecker)
-			return r.Status == auth.Auth401RecoverRefreshed || r.Status == auth.Auth401RecoverCooldown429OK
+			if r.Status == auth.Auth401RecoverRefreshed || r.Status == auth.Auth401RecoverCooldown429OK {
+				h.recordAuth401Recover(acc)
+				return true
+			}
+			return false
 		},
 		On429RecoveryFn: func(ctx context.Context, acc *auth.Account) {
 			h.manager.ScheduleUpstream429Recovery(ctx, acc, h.quotaChecker)
@@ -295,6 +314,25 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 				return
 			}
 			h.manager.InvalidateSelectorCache()
+		},
+		QuotaCheckFn: func(ctx context.Context, acc *auth.Account) bool {
+			/* 额度检查的目的是预判账号是否有效，但结果仅供参考
+			 * 现在已在 executor 中改为：额度检查失败不排除，而是继续发送真实请求
+			 * 让上游 API 的响应（401/成功）来最终决定账号是否有效
+			 * 这样可以避免因为额度 API 网络问题导致的误判
+			 *
+			 * verdict 含义：
+			 * 1 = 有效，verdict 0/2 = 查询失败/429，verdict -1 = 无效 4xx
+			 */
+			verdict := h.quotaChecker.CheckAccountResult(ctx, acc)
+			if verdict == -1 {
+				log.Warnf("账号 [%s] 额度 API 返回 4xx（无效），但仍将尝试发送请求", acc.GetEmail())
+			} else if verdict == 0 {
+				log.Debugf("账号 [%s] 额度查询网络错误/5xx，继续尝试", acc.GetEmail())
+			} else if verdict == 2 {
+				log.Debugf("账号 [%s] 额度查询 429 限频，继续尝试", acc.GetEmail())
+			}
+			return true /* 总是返回 true，让 executor 继续发送请求 */
 		},
 		MaxRetry:      h.maxRetry,
 		EmptyRetryMax: h.emptyRetryMax,
@@ -309,6 +347,76 @@ func (h *ProxyHandler) buildRetryConfig() executor.RetryConfig {
 		rc.FallbackRecentPickFn = healthyPick
 	}
 	return rc
+}
+
+/**
+ * canPerformAuth401Recover 检查账号是否可以进行 401 恢复
+ * 30 秒内最多允许 2 次刷新，防止陷入快速循环
+ */
+func (h *ProxyHandler) canPerformAuth401Recover(acc *auth.Account) bool {
+	if acc == nil {
+		return true
+	}
+	fp := acc.FilePath
+	if fp == "" {
+		return true
+	}
+
+	now := time.Now()
+	const timeWindow = 30 * time.Second
+	const maxRecoverPerWindow = 2
+
+	val, _ := h.auth401RecoverTracks.LoadOrStore(fp, &auth401RecoverTrack{
+		count:     0,
+		startTime: now,
+	})
+	track := val.(*auth401RecoverTrack)
+
+	/* 检查时间窗口是否过期 */
+	if now.Sub(track.startTime) > timeWindow {
+		/* 新窗口开始 */
+		track.count = 0
+		track.startTime = now
+	}
+
+	/* 检查是否超过限制 */
+	if track.count >= maxRecoverPerWindow {
+		return false
+	}
+
+	return true
+}
+
+/**
+ * recordAuth401Recover 记录账号的一次 401 恢复
+ */
+func (h *ProxyHandler) recordAuth401Recover(acc *auth.Account) {
+	if acc == nil {
+		return
+	}
+	fp := acc.FilePath
+	if fp == "" {
+		return
+	}
+
+	const timeWindow = 30 * time.Second
+	now := time.Now()
+
+	val, _ := h.auth401RecoverTracks.LoadOrStore(fp, &auth401RecoverTrack{
+		count:     0,
+		startTime: now,
+	})
+	track := val.(*auth401RecoverTrack)
+
+	/* 检查是否超出时间窗口 */
+	if now.Sub(track.startTime) > timeWindow {
+		/* 新窗口开始 */
+		track.count = 1
+		track.startTime = now
+	} else {
+		/* 同一窗口内计数增加 */
+		track.count++
+	}
 }
 
 /* chatStreamPumpErrorMeta 将 Pump 错误映射为 SSE data 内 OpenAI 风格 error.type/message */

@@ -168,6 +168,7 @@ func NewExecutor(baseURL, proxyURL string, poolCfg HTTPPoolConfig) *Executor {
 /**
  * RetryConfig 内部重试配置
  * @field EmptyRetryMax - 空返回时最多再重试次数
+ * @field QuotaCheckFn - 选号后检查额度的回调（可选）；返回 false 表示额度无效/未知，需继续换号
  */
 type RetryConfig struct {
 	PickFn                func(model string, excluded map[string]bool) (*auth.Account, error)
@@ -178,6 +179,7 @@ type RetryConfig struct {
 	On401Fn              func(acc *auth.Account) bool
 	On429RecoveryFn      func(ctx context.Context, acc *auth.Account)
 	OnAfterUpstreamErrFn func(acc *auth.Account, statusCode int)
+	QuotaCheckFn         func(ctx context.Context, acc *auth.Account) bool /* 返回 true 表示额度有效，false 表示无效需换号 */
 	MaxRetry             int
 	EmptyRetryMax        int
 }
@@ -423,6 +425,19 @@ func (e *Executor) sendWithRetry(ctx context.Context, rc RetryConfig, model stri
 			}
 			break
 		}
+
+		/* 选号后检查额度（如果配置了 QuotaCheckFn）；仅在确认无效时排除，不确定时继续尝试发送 */
+		if rc.QuotaCheckFn != nil {
+			if !rc.QuotaCheckFn(ctx, account) {
+				/* QuotaCheckFn 返回 false 表示额度检查失败
+				 * 但我们不立即排除，而是继续发送请求
+				 * 让上游 API 的响应来最终决定是否需要换号
+				 * 这样可以避免因为额度检查网络问题导致的误判 */
+				log.Debugf("账号 [%s] 额度检查失败，但继续尝试发送请求", account.GetEmail())
+				/* 不加入 excluded，继续使用该账号 */
+			}
+		}
+
 		httpResp, err2 := trySend(account, attempt+1, maxAttempts, pickDur)
 		if err2 == nil {
 			return httpResp, account, attempt + 1, nil
